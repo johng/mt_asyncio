@@ -781,6 +781,48 @@ def test_streams_round_trip(aio):
     assert all(aio.run(main()))
 
 
+def test_streams_read_does_not_invent_eof(aio):
+    """``read(n)`` on an empty buffer must wait, not report end of stream.
+
+    ``_wait_for_data`` returns early once the feed generation has moved, on the
+    understanding that the caller re-tests its own condition. The loops
+    (``readuntil``, ``readexactly``, ``read(-1)``) do. ``read(n)`` does not::
+
+        if not self._buffer and not self._eof:
+            await self._wait_for_data('read')
+        data = bytes(self._buffer[:n])       # empty buffer -> b'' -> EOF
+
+    so an early return with nothing buffered is indistinguishable from a closed
+    connection, and a server that believes it closes a live socket under its
+    peer. Only ``_wait_for_data`` advances ``_seen_gen``, so the generation runs
+    ahead exactly when a read consumes bytes *without* parking -- which is the
+    ordinary case once ``feed_data`` runs on another worker while this task is
+    busy. Reproduced here without threads by feeding before the first read.
+
+    Was: 12 workers serving 32 keep-alive connections dropped ~1 connection per
+    1,000 requests, reported by the peer as a reset mid-response.
+    """
+
+    async def main():
+        reader = aio.StreamReader(loop=aio.get_running_loop())
+
+        # arrives while nobody is waiting, so the read below consumes it
+        # without ever parking and `_seen_gen` is left behind
+        reader.feed_data(b'first')
+        first = await aio.wait_for(reader.read(100), TIMEOUT)
+
+        async def feed_later():
+            await aio.sleep(0.05)
+            reader.feed_data(b'second')
+
+        feeder = aio.ensure_future(feed_later())
+        second = await aio.wait_for(reader.read(100), TIMEOUT)
+        await feeder
+        return first, second
+
+    assert aio.run(main()) == (b'first', b'second')
+
+
 def test_streams_readexactly_larger_than_limit(aio):
     """readexactly(n) for n > limit exercises the pause/resume + wait path."""
     size = 300_000

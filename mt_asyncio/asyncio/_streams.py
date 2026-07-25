@@ -93,10 +93,30 @@ class StreamReader(_StreamReader):
 
         with self._lock:
             if self._feed_gen != self._seen_gen:
-                # something arrived since we last looked; let the caller re-test
-                # its own condition rather than parking on a stale view
+                # Something arrived since we last looked. Catch up, but only
+                # hand control back if there is in fact something to see.
+                #
+                # "the caller re-tests its own condition" holds for the loops --
+                # readuntil, readexactly, read(-1) -- and not for `read(n)`,
+                # which tests once:
+                #
+                #     if not self._buffer and not self._eof:
+                #         await self._wait_for_data('read')
+                #     data = bytes(self._buffer[:n])       # empty -> b'' -> EOF
+                #
+                # An empty buffer there is indistinguishable from end of stream,
+                # so returning early with nothing buffered makes `read()` report
+                # a connection closed that is still open -- and a server that
+                # believes it then closes a live socket under its peer.
+                #
+                # The generation can be ahead with the buffer empty whenever a
+                # `read()` consumed the bytes without parking, which is the
+                # normal case once feed_data runs on another worker while this
+                # task is busy: nothing advances `_seen_gen` but this function.
+                # So sync it and fall through to park.
                 self._seen_gen = self._feed_gen
-                return
+                if self._buffer or self._eof or self._exception is not None:
+                    return
             if self._eof or self._exception is not None:
                 return
             waiter = self._waiter = self._loop.create_future()
