@@ -1,6 +1,6 @@
 # mt_asyncio benchmarks
 
-Four independent benchmark families live here.
+Five independent benchmark families live here.
 
 > **Build a release extension first.** `make build-dev` (plain `maturin develop`)
 > produces a **debug** build that is several times slower than release, which
@@ -274,7 +274,158 @@ this right, and it is why the port in `_mt_wait_async_factory` follows its order
 exactly. mt_asyncio's `ScheduledIO` also grew tick-guarded `clear_r`/`clear_w`,
 which are safe either way; upstream's exposes only `consume_*`.
 
-## 4. `benchmarks.py` + `runbench.sh` — subprocess harness
+## 4. `fastapi_tax.py` — FastAPI over a real socket, three runtimes
+
+`pg_tax.py` asks what the runtime costs a driver. This asks the question a user
+actually has: **I have a FastAPI service, its handler does a little work per
+request, what changes if I swap the loop underneath it?**
+
+Three arms serve the *same* FastAPI app over HTTP/1.1 with keep-alive, driven by
+the same load generator (`oha`, so the client is Rust and not competing for the
+GIL-free Python the server is using):
+
+| arm | runtime | how FastAPI runs unmodified on it |
+| --- | --- | --- |
+| `stdlib` | stdlib asyncio | it just does |
+| `mt` | mt_asyncio | `compat.install()` — the asyncio namespace is shadowed, and starlette's few anyio touchpoints keep working because what is underneath is still asyncio-shaped |
+| `tonio` | tonio.colored | [`tonio-monkey`](https://github.com/gi0baro/tonio-monkey), which rewrites those touchpoints against tonio primitives |
+
+Neither project patches the *handler*: the endpoint is one `async def` written
+once and imported by every arm.
+
+**The server is ours, on purpose.** tonio-monkey patches fastapi and starlette
+but ships no ASGI server, and granian's loop registry is asyncio-only, so there
+is no server all three arms could share off the shelf. Letting uvicorn serve two
+arms and something hand-rolled serve the third would measure the servers. So the
+file contains one minimal HTTP/1.1 server whose parsing, scope construction, ASGI
+call and response encoding are a single shared code path (`_serve_conn`); only
+the calls that move bytes differ — `StreamReader.read`/`StreamWriter.write` on
+the asyncio arms, `SocketStream.receive_some`/`send_all` on tonio's. Each sits on
+its runtime's real connection machinery. Before measuring, every arm is probed
+once and the response bodies compared, so an arm cannot look fast by answering
+something cheaper.
+
+```bash
+uv pip install fastapi uvicorn psycopg tonio==0.8.3 'tonio-monkey[fastapi]'
+brew install oha                            # or run with --client python
+
+python bench/fastapi_tax.py                 # ping + compute, 1/2/4/8 threads
+python bench/fastapi_tax.py -w compute -t 1 2 4 8 --conns 16
+python bench/fastapi_tax.py --setup-db      # fixture table for the `pg` workload
+python bench/fastapi_tax.py --json bench/results/fastapi_tax.json
+```
+
+Three workloads, all `GET`, all differing only in what the handler does:
+
+- **`ping`** — an empty handler. The floor: HTTP parse, routing, response encode.
+- **`compute`** — the realistic one, and the point of the exercise. Path and
+  query params validated, 32 order lines aggregated in an ordinary Python loop,
+  a pydantic response model serialised. Tens of microseconds — the thing that
+  queues behind a single thread on stdlib asyncio.
+- **`pg`** — the same handler with the rows coming from Postgres, so a real
+  driver and a real socket are in the request path.
+
+Result (median of 5 runs of 20,000 requests over 16 keep-alive connections;
+tonio 0.8.3 + tonio-monkey 0.4.0 from PyPI vs this tree, release build; fastapi
+0.140.0, starlette 1.3.1; free-threaded 3.14.4, Apple M5 Max, 6 performance + 12
+efficiency cores). **req/s, higher is better:**
+
+| workload | arm | 1t | 2t | 4t | 8t | best vs stdlib |
+| --- | --- | --- | --- | --- | --- | --- |
+| `ping` | `stdlib` | 39,759 | · | · | · | 1.00× |
+| | `mt` | 19,038 | 29,808 | **45,489** | 42,904 | 1.14× |
+| | `tonio` | 44,034 | 47,920 | 58,496 | **58,723** | 1.48× |
+| `compute` | `stdlib` | 23,809 | · | · | · | 1.00× |
+| | `mt` | 14,306 | 23,822 | **35,992** | 31,261 | 1.51× |
+| | `tonio` | 25,443 | 33,000 | **42,214** | 37,531 | 1.77× |
+| `pg` | `stdlib` | 11,397 | · | · | · | 1.00× |
+| | `mt` | 7,803 | 9,385 | 10,501 | **10,900** | 0.96× |
+| | `tonio` | 12,399 | 12,629 | 13,291 | **14,815** | 1.30× |
+
+**The handler work does parallelise, and that is the whole case.** On `compute`,
+mt_asyncio goes 14,306 → 35,992 req/s from one worker to four — **2.5×** — and
+ends up 1.51× stdlib on the same app with the same handler. Nothing in the
+application was written for it.
+
+**The per-request floor is the price.** At one worker mt_asyncio serves 0.60× as
+many requests as stdlib on `compute` and 0.48× on `ping`, so it spends the first
+two workers buying back its own overhead and only the third and fourth are
+profit. That ratio is the same story `asyncio_bench.py` tells on `churn`: with
+nothing to parallelise, the heavier per-task machinery is all there is. The
+thinner the handler, the more workers it takes to break even — `ping` needs four
+to beat stdlib by 14%, `compute` needs two.
+
+**TonIO is ahead at every point**, and by more at one thread (1.07× stdlib on
+`compute`, where mt_asyncio is 0.60×) than at four (1.77× vs 1.51×). The gap is
+the asyncio layer, not the shared Rust core — `tonio_regression.py` puts the core
+at parity or better — and it is the same trade `pg_tax.py` prices: cancellation,
+contextvars, exception groups and the `Future` protocol cost something per
+operation, and `tonio.colored` does not implement them.
+
+**On `pg`, mt_asyncio never beats stdlib.** It tops out at 10,900 req/s against
+stdlib's 11,397, scaling only 1.4× across eight workers while `compute` scales
+2.5× across four. This is `pg_tax.py`'s wait-path tax showing up end to end: with
+`compat.install()`, psycopg's `wait_async` lands on an `add_reader` we emulate,
+costing several syscalls and a Python callback hop per round trip — and a query
+is exactly one wait, so there is nothing to amortise it against. tonio-monkey's
+psycopg patch goes straight at the reactor and reaches 1.30×. A psycopg-native
+waiter on our side (`bench/pg_tax.py`'s `mt-monkey`, ~40 lines) is the fix, and it
+composes with `compat.install()` rather than replacing it.
+
+**8 workers is past the knee on this machine.** Both parallel arms lose
+throughput from 4t to 8t on `compute` (mt 35,992 → 31,261; tonio 42,214 →
+37,531). There are 6 performance cores, the client wants some of them, and the
+efficiency cores are slower — this is the machine, not the runtimes.
+
+### The server is not a strawman
+
+The `-uvicorn` arms run the same app under a real server, on the two arms that
+can host one (median of 3, separate run — compare within this table, not against
+the one above):
+
+| workload | arm | 1t | 2t | 4t | 8t |
+| --- | --- | --- | --- | --- | --- |
+| `ping` | `stdlib` / `stdlib-uvicorn` | 42,742 / 15,703 | · | · | · |
+| | `mt` / `mt-uvicorn` | 20,418 / 10,199 | 30,937 / 17,860 | 46,145 / 28,005 | 43,216 / 28,799 |
+| `compute` | `stdlib` / `stdlib-uvicorn` | 24,549 / 12,636 | · | · | · |
+| | `mt` / `mt-uvicorn` | 15,259 / 8,382 | 23,941 / 15,020 | 35,866 / 24,542 | 31,656 / 24,685 |
+
+The hand-written server is ~2× uvicorn in absolute terms — it is a GET-only,
+no-body, one-write server against h11 — but the **shape is preserved**:
+mt_asyncio scales uvicorn 8,382 → 24,542 req/s on `compute` (2.9×, versus 2.4× for
+the hand-written one), so the parallelism is not an artifact of the server. Worth
+saying plainly: that is stock uvicorn off PyPI, scaled across four cores with two
+lines at the top of the file.
+
+### A defect this turned up
+
+**mt_asyncio drops connections at 8 workers.** Roughly 1 request in 20,000 —
+`connection error`, `connection closed before message completed`, `operation was
+canceled` — in 2 runs out of 5. Never at 1, 2 or 4 workers; never on stdlib;
+never on tonio. Three runs of `mt-uvicorn` at 8 workers came through clean, which
+points at the streams layer (`StreamReader`/`StreamReaderProtocol`) rather than
+the transports uvicorn drives directly, but three runs is a lead and not a
+finding. The harness reports these as `!n` beside the throughput number and keeps
+the run rather than discarding it: discarding would hide the defect *and* bias
+the survivors towards the lucky ones. Losses above 1% fail the measurement.
+
+### Caveats
+
+- **The asyncio arms carry more framework than tonio's.** `asyncio.start_server`
+  means transport + protocol + `StreamReader`/`StreamWriter`; tonio's
+  `SocketStream` is socket operations on the reactor. That is what each project
+  ships, and the asyncio route is the one uvicorn uses — but part of the `tonio`
+  column is that it has less machinery in the way, not only that it is faster.
+- **`pg` is "what each project ships", not a runtime comparison.** mt_asyncio
+  routes psycopg through the loop; tonio uses tonio-monkey's hand-written
+  psycopg waiter. `pg_tax.py` is where those are separated properly.
+- **Client and server share the box.** `oha` is native and cheap next to the
+  Python server, but it is not free, and it competes for the same 6 performance
+  cores at the higher thread counts.
+- Run-to-run spread on this machine was under ~10% for most cells; the JSON keeps
+  every sample plus the spread, so a suspicious number can be checked.
+
+## 5. `benchmarks.py` + `runbench.sh` — subprocess harness
 
 The original TonIO harness, measuring "1 million coroutines" and a TCP echo
 server against stdlib `asyncio`. Driven by `./bench/runbench.sh`, which builds a
