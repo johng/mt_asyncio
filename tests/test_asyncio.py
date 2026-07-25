@@ -521,6 +521,43 @@ def test_timeout_none_disables():
     assert aio.run(main()) == 'ok'
 
 
+def test_timeout_deadline_racing_the_body_does_not_leak_cancellation():
+    """A deadline firing just as the body finishes must not cancel past the scope.
+
+    On a single-threaded loop the timer callback and the task step take turns, so
+    "the body completed" and "the deadline fired" are never concurrent. Here they
+    run on different workers, and if the handoff is unsynchronised the timer
+    cancels a task that has already left the scope -- the CancelledError then
+    surfaces at some unrelated later await, or takes the whole run down.
+
+    Each task below sleeps for as close to its own deadline as it can, so the two
+    events land together as often as the scheduler allows.
+    """
+    escaped = []
+
+    async def main():
+        async def racer(i):
+            deadline = 0.02 + (i % 5) * 0.001
+            for _ in range(20):
+                try:
+                    async with aio.timeout(deadline):
+                        await aio.sleep(deadline)
+                except TimeoutError:
+                    pass  # expected about half the time; either outcome is fine
+                # a cancel leaking out of the scope above surfaces here
+                try:
+                    await aio.sleep(0)
+                except aio.CancelledError:
+                    escaped.append(i)
+                    raise
+            return i
+
+        return await aio.gather(*[racer(i) for i in range(24)])
+
+    assert aio.run(main(), threads=8) == list(range(24))
+    assert not escaped, f'cancellation escaped the timeout scope in {len(escaped)} task(s)'
+
+
 # --- as_completed ------------------------------------------------------------
 
 

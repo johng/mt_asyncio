@@ -26,6 +26,7 @@ import threading
 from asyncio.sslproto import SSLProtocol as _SSLProtocol, SSLProtocolState, _SSLProtocolTransport
 
 from ._transports import SocketTransport
+from ._wakes import defer_wakes
 
 
 class SSLProtocolTransport(_SSLProtocolTransport):
@@ -125,7 +126,7 @@ class SSLProtocol(_SSLProtocol):
     def _do_read(self):
         # covers `call_soon(self._do_read)`; every other caller already holds
         # the lock, and it is an RLock, so those are free
-        with self._lock:
+        with defer_wakes(), self._lock:
             super()._do_read()
 
     def _resume_reading(self):
@@ -138,7 +139,7 @@ class SSLProtocol(_SSLProtocol):
             self._loop.call_soon(self._resume_reading_locked)
 
     def _resume_reading_locked(self):
-        with self._lock:
+        with defer_wakes(), self._lock:
             if self._state == SSLProtocolState.WRAPPED:
                 self._do_read()
             elif self._state == SSLProtocolState.FLUSHING:
@@ -149,19 +150,19 @@ class SSLProtocol(_SSLProtocol):
     # -- timer callbacks ----------------------------------------------------
 
     def _check_handshake_timeout(self):
-        with self._lock:
+        with defer_wakes(), self._lock:
             super()._check_handshake_timeout()
 
     def _check_shutdown_timeout(self):
-        with self._lock:
+        with defer_wakes(), self._lock:
             super()._check_shutdown_timeout()
 
     def _on_handshake_complete(self, handshake_exc):
-        with self._lock:
+        with defer_wakes(), self._lock:
             super()._on_handshake_complete(handshake_exc)
 
     def _on_shutdown_complete(self, shutdown_exc):
-        with self._lock:
+        with defer_wakes(), self._lock:
             super()._on_shutdown_complete(shutdown_exc)
 
 

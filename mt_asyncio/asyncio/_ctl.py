@@ -16,6 +16,7 @@ from asyncio import CancelledError, TimeoutError as _TimeoutError
 from .._mt_asyncio import Event as _Event
 from ._loop import EventLoop
 from ._tasks import _park, _running_loop, current_task, ensure_future, get_running_loop
+from ._timeouts import timeout as _timeout_ctx
 
 
 __all__ = [
@@ -67,6 +68,11 @@ def _cancel_all_tasks(loop):
 
 
 async def _yield_now():
+    # the one suspension point that does not go through `Future.__await__`, so
+    # it has to hand back connection claims itself (see `_transports`)
+    task = current_task()
+    if task is not None and task._mt_claims is not None:
+        task._mt_release_claims()
     ev = _Event()
     ev.set()
     await ev.waiter(None)
@@ -90,37 +96,56 @@ def _set_result_unless_done(fut, value):
         fut.set_result(value)
 
 
-async def wait_for(aw, timeout):
+def _release_waiter(waiter, *_args):
+    if not waiter.done():
+        waiter.set_result(None)
+
+
+async def _cancel_and_wait(fut):
+    """Cancel `fut` and wait for it to settle, on a waiter of our own.
+
+    CPython's helper, same shape: awaiting `fut` directly would make the wait
+    depend on the cancellation it is performing.
+    """
     loop = get_running_loop()
-    task = ensure_future(aw, loop=loop)
-    if timeout is None:
-        return await _park(task)
-    if timeout <= 0:
-        if task.done():
-            return task.result()
-        task.cancel()
-        try:
-            await _park(task)
-        except CancelledError:
-            pass
-        raise _TimeoutError from None
-
-    state = {'timed_out': False}
-
-    def _on_timeout():
-        if not task.done():
-            state['timed_out'] = True
-            task.cancel()
-
-    handle = loop.call_later(timeout, _on_timeout)
+    waiter = loop.create_future()
+    cb = functools.partial(_release_waiter, waiter)
+    fut.add_done_callback(cb)
     try:
-        return await _park(task)
-    except CancelledError:
-        if state['timed_out'] and task.cancelled():
-            raise _TimeoutError from None
-        raise
+        fut.cancel()
+        await waiter
     finally:
-        handle.cancel()
+        fut.remove_done_callback(cb)
+
+
+async def wait_for(aw, timeout):
+    """CPython 3.12+'s shape: a cancel scope around a direct await.
+
+    What this replaced wrapped `aw` in a Task, armed a `call_later`, and parked
+    on the Task. The intermediate Task is what costs here specifically: on a
+    single-threaded loop its completion is a same-thread callback, but on this
+    runtime it is a cross-worker wake, so the wrapper cost about as much again
+    as the wait it wrapped -- 22.0us against 6.6us for the bare park/wake, on
+    psycopg's `wait_for(Event.wait(), 0.1)`. Awaiting `aw` on the calling task
+    leaves only the timer.
+
+    `timeout <= 0` keeps the Task: there the awaitable has to be cancelled and
+    awaited to completion before `TimeoutError` goes out, and only a future can
+    be cancelled that way.
+    """
+    if timeout is not None and timeout <= 0:
+        loop = get_running_loop()
+        fut = ensure_future(aw, loop=loop)
+        if fut.done():
+            return fut.result()
+        await _cancel_and_wait(fut)
+        try:
+            return fut.result()
+        except CancelledError as exc:
+            raise _TimeoutError from exc
+
+    async with _timeout_ctx(timeout):
+        return await aw
 
 
 def shield(aw):

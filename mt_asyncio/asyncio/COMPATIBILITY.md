@@ -38,6 +38,35 @@ get multiple cores), but it means:
 
 It is unavoidable for real parallelism. It is the single largest behavioral difference from stdlib asyncio.
 
+### The exception: one connection is still serialized
+
+Transports are the one place the guarantee is put back, because protocol objects
+are written against it and cannot be locked from outside. For a single
+connection, `mt_asyncio.asyncio` reproduces the stdlib ordering exactly:
+
+1. **Callbacks never overlap.** One `RLock` per connection covers
+   `data_received`, `_write_ready`, `connection_made`, `connection_lost` and every
+   app-facing method. See `_transports.py`.
+2. **A callback finishes before any task it woke takes a step.** Completing a
+   future inside a callback only *schedules* the awaiter in stdlib; it did so
+   immediately here, on another worker. Wakes raised inside a protocol callback
+   are now held until it returns. See `_wakes.py`.
+3. **No callback runs between a task's `write()` and its next suspension.** A
+   stdlib loop cannot regain control in that window, and protocols finish
+   mutating themselves there — asyncpg assigns `self.statement` *after* the bytes
+   are on the wire. `write()` claims the connection for the writing task and the
+   claim is handed back when it suspends. See `_transports.py`.
+
+(2) and (3) are not documented asyncio guarantees; they are emergent properties
+of a single-threaded loop that library authors were entitled to rely on. Both
+were found the hard way — (2) as `InternalClientError: cannot switch to state 12`
+and (3) as a segfault in `_decode_row`, in asyncpg, above four workers.
+
+Parallelism therefore comes from having **many** connections, not from splitting
+one. What is still *not* restored is any ordering between a connection's
+callbacks and tasks that touch it without writing to it; a library that shares
+mutable state across tasks is on its own (see §6).
+
 ---
 
 ## 2. Requirements

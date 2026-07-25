@@ -33,6 +33,7 @@ from . import _net
 from ._futures import Future
 from ._reactor import reactor as _reactor
 from ._tasks import Task, _park, _running_loop
+from ._wakes import pending_wakes
 
 
 class Handle:
@@ -389,7 +390,14 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
         self._check_closed()
         self._ensure_reactor()
         h = Handle(cb, args, _handle_context(context))
-        get_runtime()._call_soon(h._run)
+        pending = pending_wakes()
+        if pending is None:
+            get_runtime()._call_soon(h._run)
+        else:
+            # inside a protocol callback: queueing the handle now would let
+            # another worker run it before this callback returns, which is the
+            # one thing asyncio's loop never does (see `._wakes`)
+            pending.append(functools.partial(get_runtime()._call_soon, h._run))
         return h
 
     call_soon_threadsafe = call_soon

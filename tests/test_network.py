@@ -486,6 +486,170 @@ def test_concurrent_writers_do_not_interleave(aio):
     assert splits == 0, f'{splits} interleaved/spliced writes'
 
 
+def test_callback_finishes_before_the_task_it_woke_resumes(aio):
+    """The other half of the per-connection contract, and asyncpg's shape exactly.
+
+    Serialising a connection's callbacks is not enough on its own. asyncio also
+    guarantees that a callback *completes* before any task it woke takes a step,
+    because completing a future only schedules the awaiter. Protocols rely on
+    that to finish tidying up after they have handed the result over --
+    ``asyncpg``'s ``_push_result`` is::
+
+        self._on_result()               # -> waiter.set_result(...)
+        self._set_state(PROTOCOL_IDLE)  # ...only after
+
+    Resume the awaiter the moment the result lands and it issues its next
+    command against a protocol that still says a command is in flight. Real
+    asyncpg raises ``InternalClientError: cannot switch to state 12`` here; the
+    protocol below just records it.
+    """
+    conns, rounds = 4, 40
+    msg = b'ping'
+    # a real protocol has work left after handing the result over; this stands
+    # in for asyncpg's `_set_state` + `_reset_result` and the rest of its parse
+    # loop. Long enough that another worker would get the task if it could.
+    tidy_up = 20000
+
+    class PushResult(asyncio.Protocol):
+        def __init__(self, loop):
+            self.loop = loop
+            self.buf = bytearray()
+            self.waiter = None
+            self.in_flight = False
+            self.resumed = False
+            self.violations = []
+            self.transport = None
+
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def request(self):
+            if self.in_flight:
+                self.violations.append('request issued while the previous one was still in flight')
+            self.in_flight = True
+            self.waiter = self.loop.create_future()
+            self.transport.write(msg)
+            return self.waiter
+
+        def data_received(self, data):
+            self.buf.extend(data)
+            while len(self.buf) >= len(msg):
+                del self.buf[: len(msg)]
+                waiter, self.waiter = self.waiter, None
+                if waiter is None or waiter.done():
+                    continue
+                self.resumed = False
+                waiter.set_result(True)
+                for _ in range(tidy_up):
+                    if self.resumed:
+                        self.violations.append('awaiter resumed while data_received was still running')
+                        break
+                self.in_flight = False  # the ordering under test
+
+    async def main():
+        loop = aio.get_running_loop()
+        server, port = await _serve(aio)
+        try:
+
+            async def one():
+                transport, proto = await loop.create_connection(lambda: PushResult(loop), '127.0.0.1', port)
+                try:
+                    for _ in range(rounds):
+                        await aio.wait_for(proto.request(), TIMEOUT)
+                        proto.resumed = True
+                finally:
+                    transport.close()
+                return proto.violations
+
+            return [v for vs in await aio.gather(*[one() for _ in range(conns)]) for v in vs]
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    assert aio.run(main()) == []
+
+
+def test_reader_does_not_run_between_a_write_and_the_next_suspension(aio):
+    """The mirror image, and the one that segfaults asyncpg.
+
+    A write is not the end of a task's dealings with its protocol. asyncpg's
+    ``bind_execute`` finishes setting itself up *after* the bytes are on the
+    wire::
+
+        self._bind_execute(portal_name, state.name, args_buf, limit)  # network op
+        self.last_query = state.query
+        self.statement = state          # <- the reply handler needs this
+
+    On a single-threaded loop the reply cannot be processed in that window,
+    because the loop only gets control back when the coroutine suspends. Take
+    that away and ``data_received`` runs against a half-built request: real
+    asyncpg finds ``self.statement`` still ``None`` and, since its guard is
+    compiled out of release builds, calls into ``None`` as though it were a
+    ``PreparedStatementState``.
+    """
+    conns, rounds = 6, 30
+    msg = b'ping'
+    # long enough that the loopback reply lands inside the window, short enough
+    # to stay well under the reader's deferral backstop
+    settle = 40000
+
+    class WriteThenFinish(asyncio.Protocol):
+        def __init__(self, loop):
+            self.loop = loop
+            self.buf = bytearray()
+            self.waiter = None
+            self.request_ready = None
+            self.seen_early = False
+            self.violations = []
+            self.transport = None
+
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def request(self):
+            waiter = self.waiter = self.loop.create_future()
+            self.request_ready = None
+            self.transport.write(msg)  # network op
+            for _ in range(settle):
+                if self.seen_early:
+                    break
+            self.request_ready = 'ready'
+            return waiter
+
+        def data_received(self, data):
+            self.buf.extend(data)
+            while len(self.buf) >= len(msg):
+                del self.buf[: len(msg)]
+                if self.request_ready is None:
+                    self.seen_early = True
+                    self.violations.append('reply parsed before the request had finished setting up')
+                self.request_ready = None  # asyncpg clears it in `_on_result`
+                waiter, self.waiter = self.waiter, None
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(True)
+
+    async def main():
+        loop = aio.get_running_loop()
+        server, port = await _serve(aio)
+        try:
+
+            async def one():
+                transport, proto = await loop.create_connection(lambda: WriteThenFinish(loop), '127.0.0.1', port)
+                try:
+                    for _ in range(rounds):
+                        await aio.wait_for(proto.request(), TIMEOUT)
+                finally:
+                    transport.close()
+                return proto.violations
+
+            return [v for vs in await aio.gather(*[one() for _ in range(conns)]) for v in vs]
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    assert aio.run(main()) == []
+
+
 def test_connection_lost_is_reported(aio):
     class Dropper(asyncio.Protocol):
         def connection_made(self, transport):

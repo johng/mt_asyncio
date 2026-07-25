@@ -21,6 +21,7 @@ from types import GenericAlias
 
 from .._mt_asyncio import Event as _Event
 from ._context import _current_task, get_running_loop
+from ._wakes import pending_wakes
 
 
 _PENDING = 'PENDING'
@@ -75,6 +76,11 @@ class Future:
                         raise task._make_cancelled_error()
                     task._fut_waiter = self
             self._asyncio_future_blocking = True
+            if task is not None and task._mt_claims is not None:
+                # about to suspend: this is the point a single-threaded loop
+                # would regain control, so connections claimed by a write go
+                # back now (see `_transports`)
+                task._mt_release_claims()
             try:
                 yield self._event.waiter(None)  # mt_asyncio registers this Waiter on _event
             finally:
@@ -117,7 +123,7 @@ class Future:
             self._state = _FINISHED
             cbs = self._callbacks
             self._callbacks = []
-        self._event.set()
+        self._wake()
         self._run_callbacks(cbs)
 
     def set_exception(self, exception):
@@ -132,7 +138,7 @@ class Future:
             self._state = _FINISHED
             cbs = self._callbacks
             self._callbacks = []
-        self._event.set()
+        self._wake()
         self._run_callbacks(cbs)
 
     def cancel(self, msg=None):
@@ -143,9 +149,24 @@ class Future:
             self._cancel_message = msg
             cbs = self._callbacks
             self._callbacks = []
-        self._event.set()
+        self._wake()
         self._run_callbacks(cbs)
         return True
+
+    def _wake(self):
+        """Release the awaiters -- now, or at the end of the enclosing callback.
+
+        The future is *complete* either way: ``done()`` is already True and
+        ``result()`` already returns, because the state transition happened
+        under ``_lock`` above. All that can be held back is the resumption of a
+        task parked on it, and only until the protocol callback that completed
+        it has finished. See :mod:`._wakes`.
+        """
+        pending = pending_wakes()
+        if pending is None:
+            self._event.set()
+        else:
+            pending.append(self._event.set)
 
     # -- callbacks ----------------------------------------------------------
 
