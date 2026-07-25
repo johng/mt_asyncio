@@ -8,6 +8,10 @@ on:
   push:
     branches:
       - main
+  # `release` calls this before it builds anything. Both workflows trigger on a
+  # push to main, so on a release merge the suite runs twice -- but in parallel,
+  # and only the copy release waits on can hold up a publish.
+  workflow_call:
 
 jobs:
   linux:
