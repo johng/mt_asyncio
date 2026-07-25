@@ -110,7 +110,10 @@ learns that its callbacks and its tasks are now running on twelve threads.
 
 The synthetic suite covers the shapes this one workload cannot: CPU work between
 awaits reaches 7.34× at 16 threads, while timers and cancellation are genuinely
-slower than stdlib. See [Performance](#performance).
+slower than stdlib. See [Performance](#performance) — and read its note on what
+the CPU kernel does and does not stand in for before planning around the high
+numbers. The asyncpg table above is the more representative one, because the
+per-row work there is ordinary object handling rather than arithmetic.
 
 ## Why
 
@@ -398,6 +401,16 @@ Speedup versus stdlib asyncio on the same coroutines (free-threaded CPython
 | pure scheduling, no per-task work | 1.41× | 1.60× @16 |
 | many real `sleep()` timers | 0.51× | 0.55× @4 |
 | create + cancel + unwind | 0.62× | 0.62× @1 |
+
+**The CPU kernel here is arithmetic on locals** — `x += i * i`, no allocation,
+no shared object touched, and so the easiest work free-threaded Python can be
+asked to parallelize. Real handler code churns objects and refcounts things every
+thread shares, and pays for it: measured head to head at equal wall-clock weight,
+an allocating kernel scales 2.85× on twelve workers where this one scales 5.09×.
+Treat the high numbers below as the runtime's ceiling with contention removed,
+not as a forecast for application code — `bench/fastapi_tax.py` measures the
+difference, and `bench/README.md` §4 shows a real FastAPI handler plateauing near
+2.9×.
 
 Read that honestly. mt_asyncio is at rough parity per-thread and wins by
 parallelizing, so the more real work a task does between awaits, the better it

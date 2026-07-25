@@ -16,16 +16,32 @@ An external lock around ``_wait_for_data`` cannot fix that: the *check* belongs
 to the caller, outside anything we can wrap. So the wake condition becomes a
 generation counter. Every feed bumps ``_feed_gen``; ``_wait_for_data`` parks only
 if nothing has been fed since it last looked. Either it observes a new generation
-and returns (the caller re-tests its own condition and loops), or it registers
-under the lock and ``_wakeup_waiter`` finds it there.
+and returns, or it registers under the lock and ``_wakeup_waiter`` finds it there.
 
-Returning early on a *generation change* rather than on "buffer is non-empty" is
-what stops ``readexactly(n)`` spinning: with data present but fewer than ``n``
-bytes, the next call sees the generation unchanged and parks properly.
+Two conditions govern that early return, and both are load-bearing. It triggers
+on a *generation change* rather than on "buffer is non-empty", which is what
+stops ``readexactly(n)`` spinning: with data present but fewer than ``n`` bytes,
+the next call sees the generation unchanged and parks properly. And it returns
+only when there is in fact something to see -- a non-empty buffer, EOF or an
+exception -- because ``read(n)`` tests its condition once rather than looping, so
+returning with an empty buffer would have it report a stream that ended. See
+``_wait_for_data``.
 
-Lock order is **transport -> flow control -> reader**, and nothing may hold the
-reader lock while calling into the transport (see ``_maybe_resume_transport``) or
-the two deadlock against ``data_received``.
+Lock order is **transport -> flow control -> reader**. Stated precisely, the rule
+is that nothing may take the transport lock *for the first time* while holding
+the reader lock, or it deadlocks against ``data_received`` coming the other way.
+``_maybe_resume_transport`` and ``_wait_for_data`` are written around it: both
+decide under the reader lock and call ``resume_reading()`` outside it, because
+both run in the reading task, which holds no transport lock of its own.
+
+``feed_data`` looks like it breaks the rule and does not: it holds the reader lock
+across ``super().feed_data()``, which calls ``transport.pause_reading()`` once the
+buffer passes ``2 * limit``. But every caller of ``feed_data``/``feed_eof``/
+``set_exception`` arrives from a protocol callback, entered with the transport's
+RLock already held *by this thread*, so the acquisition is re-entrant and closes
+no cycle (measured: 31,070 of them under a flow-control-saturating load, every
+one re-entrant). Feeding a transport-backed reader from outside a protocol
+callback would make it a real inversion.
 """
 
 from __future__ import annotations
@@ -93,10 +109,23 @@ class StreamReader(_StreamReader):
 
         with self._lock:
             if self._feed_gen != self._seen_gen:
-                # something arrived since we last looked; let the caller re-test
-                # its own condition rather than parking on a stale view
+                # Something arrived since we last looked. Catch up, but hand
+                # control back only if there is something to see: `read(n)` tests
+                #
+                #     if not self._buffer and not self._eof:
+                #         await self._wait_for_data('read')
+                #     data = bytes(self._buffer[:n])       # empty -> b'' -> EOF
+                #
+                # once, so returning with an empty buffer has it report a closed
+                # connection that is still open -- and a server that believes
+                # that closes a live socket under its peer. The generation runs
+                # ahead of an empty buffer whenever a read consumed the bytes
+                # without parking (nothing but this function advances
+                # `_seen_gen`), which is the normal case once feed_data lands on
+                # another worker while this task is busy.
                 self._seen_gen = self._feed_gen
-                return
+                if self._buffer or self._eof or self._exception is not None:
+                    return
             if self._eof or self._exception is not None:
                 return
             waiter = self._waiter = self._loop.create_future()

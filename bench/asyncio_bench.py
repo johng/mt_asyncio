@@ -41,7 +41,14 @@ import time
 
 
 def _burn(n):
-    """Deterministic CPU kernel: pure-Python integer work, no allocation churn."""
+    """Deterministic CPU kernel: pure-Python integer work, no allocation churn.
+
+    No allocation means nothing for free-threading to contend on, so this is the
+    easiest work there is to parallelise and the speedups it produces are a
+    ceiling rather than a forecast -- roughly double what an allocating kernel of
+    the same wall-clock weight gets. `bench/fastapi_tax.py --cpu-kind` measures
+    both; `bench/README.md` section 4 has the comparison.
+    """
     x = 0
     for i in range(n):
         x += i * i
