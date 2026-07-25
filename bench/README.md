@@ -434,6 +434,27 @@ TonIO leads everywhere the per-operation cost dominates — that is the asyncio
 layer, priced in `tonio_regression.py` — and the lead disappears once the
 handler, which both runtimes step identically, is the bulk of the request.
 
+**`--cpu` flatters, so treat those figures as an upper bound.** `_burn` is
+arithmetic on locals: it allocates nothing and touches no shared object, which is
+the easiest thing free-threading can be asked to parallelise. `--lines` is the
+realistic dial — a loop over tuples building dicts and strings, looking up shared
+classes. Matched against each other (32 connections, median of 3):
+
+| work added per request | arm | 1t | 4t | 8t | 12t | best vs stdlib |
+| --- | --- | --- | --- | --- | --- | --- |
+| ~93 µs, `--lines 2048` (allocating) | `stdlib` | 7,205 | · | · | · | 1.00× |
+| | `mt` | 6,312 | 15,653 | 17,125 | **17,265** | 2.40× |
+| | `tonio` | 7,603 | 16,209 | **18,330** | 16,035 | 2.54× |
+| ~126 µs, `--cpu 5000` (arithmetic) | `stdlib` | 7,692 | · | · | · | 1.00× |
+| | `mt` | 6,383 | 20,278 | 20,314 | **22,533** | 2.93× |
+| | `tonio` | 8,052 | 22,393 | **24,976** | 24,575 | 3.25× |
+
+The synthetic loop adds *more* work and still scales better — 2.93× against
+2.40× for mt_asyncio, 3.25× against 2.54× for TonIO. So roughly 20-25% of the
+`--cpu` column is the kernel being unusually friendly to parallelism, and a real
+handler of the same weight should be expected nearer the `--lines` row. The
+shape of the argument is unchanged; the top of the range is not a promise.
+
 ### It is not the framework
 
 The obvious suspicion about a 1.5× is that FastAPI is the bottleneck — all that

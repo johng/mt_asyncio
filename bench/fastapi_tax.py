@@ -64,6 +64,12 @@ On this machine the default (a genuinely tiny handler) is 1.3-1.5x stdlib, and
 `--cpu 50000` is 6.35x. Neither is the "real" number; the curve is (see
 `bench/README.md`).
 
+Prefer ``--lines`` when the answer matters. ``_burn`` is arithmetic on locals --
+it allocates nothing and touches no shared object, so it parallelises more
+easily than any real handler does; measured head to head it is worth 20-25% of
+apparent speedup over an allocating loop of the same weight. ``--cpu`` is the
+cheap dial and comparable with ``pg_tax.py``; ``--lines`` is the honest one.
+
 Setup::
 
     uv pip install fastapi uvicorn psycopg tonio==0.8.3 'tonio-monkey[fastapi]'
