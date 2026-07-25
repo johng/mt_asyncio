@@ -1,77 +1,62 @@
 """FastAPI over a real socket: stdlib asyncio vs mt_asyncio vs TonIO.
 
 ``pg_tax.py`` asks what the runtime costs a driver. This asks the question a
-user actually has: **I have a FastAPI service, its handler does a little work
-per request, what happens if I change the loop underneath it?**
+user actually has: **I have a FastAPI service whose handler does a little work
+per request -- what changes if I swap the loop underneath it?**
 
-Three arms, all serving the *same* FastAPI application over HTTP/1.1 with
-keep-alive, all driven by the same load generator:
+Three arms serve the *same* FastAPI application over HTTP/1.1 with keep-alive,
+driven by the same load generator::
 
-  stdlib   stdlib asyncio                         -- the reference
-  mt       mt_asyncio + ``compat.install()``      -- what we ship
-  tonio    tonio.colored + ``tonio_monkey``       -- upstream's answer
+  stdlib   stdlib asyncio                      -- the reference
+  mt       mt_asyncio + ``compat.install()``   -- what we ship
+  tonio    tonio.colored + ``tonio_monkey``    -- upstream's answer
 
-FastAPI itself runs unmodified on all three, by the two routes the projects
-take. Ours is ``compat.install()``: shadow the stdlib asyncio namespace and
-starlette's few anyio touchpoints keep working because the loop underneath is
-asyncio-shaped. Upstream's is ``tonio-monkey``, which rewrites those touchpoints
-against tonio primitives. Neither project patches the *handler* -- the endpoint
-below is one ``async def`` written once and imported by every arm.
+FastAPI runs unmodified on all three. Ours shadows the stdlib asyncio namespace,
+so starlette's few anyio touchpoints keep working because what is underneath is
+still asyncio-shaped; upstream's rewrites those touchpoints against tonio
+primitives. Neither patches the *handler* -- the endpoint below is one
+``async def`` written once and used by every arm.
 
-**The server is ours, on purpose.** tonio-monkey patches fastapi and starlette
-but ships no ASGI server, and granian's loop registry is asyncio-only, so there
-is no server all three arms could share off the shelf. Rather than let uvicorn
-serve two arms and something hand-rolled serve the third -- which would measure
-the servers, not the runtimes -- this file contains one minimal HTTP/1.1 server
-whose parsing, scope construction, ASGI call and response encoding are a single
-shared code path (``_serve_conn``). Only the four lines that move bytes differ:
-``StreamReader.read``/``StreamWriter.write`` on the asyncio arms,
-``SocketStream.receive_some``/``send_all`` on tonio's. Both sit on their
-runtime's real connection machinery -- asyncio streams are transports and
-protocols underneath, which is the path uvicorn uses and the one mt_asyncio
-serialises per connection.
+**The server is ours, on purpose.** tonio-monkey ships no ASGI server and
+granian's loop registry is asyncio-only, so nothing off the shelf can host all
+three arms, and letting uvicorn serve two while something hand-rolled serves the
+third would measure the servers. So ``_serve_conn`` is one shared code path --
+parse, build scope, call the app, encode -- and the arms supply only the calls
+that move bytes: ``StreamReader``/``StreamWriter`` on the asyncio arms,
+``SocketStream.receive_some``/``send_all`` on tonio's, each on its runtime's real
+connection machinery. It is minimal in the ways a benchmark can afford (GET only,
+no request body, no chunked encoding, one write per response) and identical for
+everyone. The ``-uvicorn`` arms are a calibration check on that, not a
+comparison; tonio cannot appear there at all.
 
-It is minimal in the ways a benchmark can afford (GET only, no request body, no
-chunked encoding, the response written in one go) and identical for everyone, so
-what is left in the gaps is the runtime.
-
-The ``uvicorn`` arms are a calibration check, not a comparison: they run the same
-app under a real server on the two arms that can host one, so the hand-written
-server can be shown to be in the right ballpark rather than a strawman. tonio
-cannot appear there at all.
-
-Workloads:
+Workloads::
 
   ping      an empty handler. The floor: HTTP parse, routing, response encode.
-  compute   the realistic one. Path and query params validated, order lines
-            aggregated in Python, a pydantic response model serialised.
-  pg        the same handler with the rows coming from Postgres instead of
-            memory, so a real driver and a real socket are in the request path.
-  raw       the same aggregate reached without FastAPI -- a control on how much
-            of the scaling limit is the framework rather than the runtime.
+  compute   params validated, order lines aggregated, a pydantic response model
+            serialised -- what a JSON endpoint does between awaits.
+  pg        the same handler with the rows coming from Postgres.
+  raw       the same aggregate without FastAPI -- a control on how much of the
+            scaling limit is the framework rather than the runtime.
 
-**The number you get is a function of how much work the handler does, and it is
-worth reading that before quoting any of this.** A request costs a fixed amount
--- read the socket, parse HTTP, route, validate, serialise, write -- plus
-whatever the handler does. Only part of that fixed cost is Python that
-parallelises. So the speedup is Amdahl's, and the two dials move the parallel
-fraction directly:
+**How much the handler does decides the answer**, so the dials matter more than
+any single number::
 
+  --cpu N       units of extra CPU work in the handler (~1.48us each)
+  --cpu-kind K  what that work *is* -- churn (default) or burn
   --lines N     order lines the handler aggregates (default 32)
-  --cpu N       units of extra CPU work in the handler
-  --cpu-kind K  what that work *is* -- and it changes the answer
 
-``--cpu-kind churn`` (the default) is one small object built and read back
-through a property, two f-strings, a dict, and a ``json`` round trip per unit:
-allocation, and refcount traffic on objects every worker shares. ``burn`` is
-``pg_tax.py``'s ``x += i * i``, which allocates nothing and touches nothing
-shared. The second is the easiest work there is to parallelise and overstates
-the speedup by 20-25% at equal wall-clock weight, so it is kept for
-comparability with ``pg_tax.py`` rather than used by default.
+``churn`` builds a small object, reads it back through a property, formats two
+strings, builds a dict and round-trips it through ``json``: it allocates, and it
+refcounts objects every worker shares, which is what handler code does. ``burn``
+is ``pg_tax.py``'s ``x += i * i`` -- no allocation, nothing shared, and therefore
+the easiest work there is to parallelise. They disagree by roughly a factor of
+two on the speedup at equal weight, so ``burn`` is kept for comparability with
+``pg_tax.py`` and ``churn`` is what the numbers are quoted from.
 
-On this machine the default (a genuinely tiny handler) is 1.3-1.5x stdlib and a
-handler doing ~1ms of realistic work is around 5x. Neither is the "real" number;
-the curve is (see ``bench/README.md``).
+Measured here: ~1.5x stdlib for a handler that does nothing, rising to a plateau
+near **2.9x** once it does a few hundred microseconds of work, and it takes 12
+workers to get there. Past that the limit is what free-threaded CPython charges
+for shared-object churn, not the runtime -- see ``bench/README.md``.
 
 Setup::
 
@@ -79,15 +64,14 @@ Setup::
     brew install oha            # or run with --client python
 
     # for the `pg` workload only
-    docker run -d --rm --name mtaio-bench-pg -e POSTGRES_PASSWORD=bench \\
+    docker run -d --rm --name mtaio-bench-pg -e POSTGRES_PASSWORD=bench \
         -e POSTGRES_DB=bench -p 55432:5432 postgres:17-alpine
     python bench/fastapi_tax.py --setup-db
 
 Usage::
 
     python bench/fastapi_tax.py
-    python bench/fastapi_tax.py -w compute --threads 1 2 4 8 12 --cpu 200
-    python bench/fastapi_tax.py -w compute --cpu 5000 --cpu-kind burn  # pg_tax's
+    python bench/fastapi_tax.py -w compute --threads 1 2 4 8 12 --cpu 315
     python bench/fastapi_tax.py -w compute raw --lines 512   # framework control
     python bench/fastapi_tax.py --arms stdlib mt --conns 32
     python bench/fastapi_tax.py --json bench/results/fastapi_tax.json
@@ -113,17 +97,8 @@ import traceback
 DEFAULT_DSN = 'postgresql://postgres:bench@127.0.0.1:55432/bench'
 
 #: order lines per request (`--lines`), and how many customers the fixture holds.
-#:
-#: This is the dial that decides the whole answer, so it is worth being explicit
-#: about. A request costs a fixed amount -- read the socket, parse HTTP, route,
-#: validate, serialise, write -- plus the handler's loop over `lines` rows. Only
-#: some of that fixed cost is Python that parallelises; the socket and reactor
-#: work does not. So the achievable speedup is Amdahl's, and `lines` moves the
-#: parallel fraction directly.
-#:
-#: 32 is a plausible order and the default, which makes the default table the
-#: *pessimistic* case rather than the flattering one. `--lines 256` is what a
-#: report endpoint or a serialiser over a page of results looks like.
+#: 32 is a plausible order and makes the default run the thin-handler end of the
+#: curve; `--cpu` is the wider dial. See the module docstring.
 LINES = 32
 CUSTOMERS = 512
 
@@ -163,10 +138,11 @@ def _burn(n):
     """`pg_tax.py`'s CPU kernel, so `--cpu-kind burn` means the same thing it does there.
 
     Arithmetic on locals: no allocation, no shared object touched, nothing for
-    free-threading to contend on. That makes it the *easiest* work there is to
-    parallelise, and measurably so -- head to head against `_churn` below it is
-    worth 20-25% of apparent speedup at equal wall-clock weight. Kept because it
-    is the dial `pg_tax.py` uses and it is cheap to sweep; not the default.
+    free-threading to contend on -- the easiest work there is to parallelise. At
+    a weight matched to `_churn` it reports 5.09x against 2.85x on twelve
+    workers, i.e. nearly double the speedup for the same wall-clock work. Kept
+    for comparability with `pg_tax.py`; not the default, and not the number to
+    quote.
     """
     x = 0
     for i in range(n):
