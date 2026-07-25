@@ -503,16 +503,41 @@ the hand-written one), so the parallelism is not an artifact of the server. Wort
 saying plainly: that is stock uvicorn off PyPI, scaled across four cores with two
 lines at the top of the file.
 
-### A defect this turned up
+### A defect this turned up — found and fixed
 
-**mt_asyncio drops connections at 8 workers.** Roughly 1 request in 20,000 —
-`connection error`, `connection closed before message completed`, `operation was
-canceled` — in 2 runs out of 5. Never at 1, 2 or 4 workers; never on stdlib;
-never on tonio. Three runs of `mt-uvicorn` at 8 workers came through clean, which
-points at the streams layer (`StreamReader`/`StreamReaderProtocol`) rather than
-the transports uvicorn drives directly, but three runs is a lead and not a
-finding. The harness reports these as `!n` beside the throughput number and keeps
-the run rather than discarding it: discarding would hide the defect *and* bias
+The tables above were measured before the fix and still carry its `!n` marks;
+they are left as they were run.
+
+**mt_asyncio dropped connections at 8+ workers** — roughly 1 request in 20,000,
+reported by the peer as `connection error` or `connection closed before message
+completed`, in 2 runs out of 5 and worse under load. Never at 1, 2 or 4 workers;
+never on stdlib; never on tonio. `mt-uvicorn` came through clean, which pointed
+at the streams layer rather than the transports uvicorn drives directly.
+
+That held up. Reduced to a keep-alive echo server with no HTTP and no FastAPI,
+in a fixed-size protocol where no early close is legal, errors per 64,000
+requests:
+
+| workers | 1 | 2 | 4 | 8 | 12 |
+| --- | --- | --- | --- | --- | --- |
+| `start_server` (streams) | 0 | 0 | 1 | 4 | **59** |
+| `create_server` (raw protocol) | 0 | — | 0 | — | 0 |
+| stdlib, streams | 0 | — | — | — | 0 |
+
+The server logged a clean EOF on every failed connection and no exception at
+all: `read()` was returning `b''` while the peer was still waiting for its
+reply, so the handler closed a live socket. `StreamReader._wait_for_data`
+returns early once the feed generation moves, which the reading loops handle by
+re-testing — but `read(n)` tests once and then returns whatever is buffered, and
+an empty buffer there means EOF. The generation runs ahead precisely when a read
+consumes bytes *without* parking, i.e. when `feed_data` lands on another worker
+while the task is busy, which is why it needed more than one worker and got
+worse with more. Fixed in `mt_asyncio/asyncio/_streams.py`; 0 errors over
+576,000 requests at 16 workers afterwards, with a threadless regression test in
+`tests/test_network.py`.
+
+The harness reports losses as `!n` beside the throughput number and keeps the
+run rather than discarding it — discarding would have hidden this *and* biased
 the survivors towards the lucky ones. Losses above 1% fail the measurement.
 
 ### Caveats
@@ -534,9 +559,9 @@ the survivors towards the lucky ones. Losses above 1% fail the measurement.
   never has to contend over. Quote `churn`.
 - Run-to-run spread on this machine was under ~10% for most cells; the JSON keeps
   every sample plus the spread, so a suspicious number can be checked.
-- **mt_asyncio's connection loss gets worse with load.** At `--cpu 700`/12
-  workers the `!n` markers appear in most runs rather than a minority of them.
-  Same defect as below, more of it.
+- **The `!n` marks in these tables predate the streams fix below.** They were
+  real when measured; the same runs are clean now. Throughput is unaffected —
+  the losses were a handful of requests in tens of thousands.
 
 ## 5. `benchmarks.py` + `runbench.sh` — subprocess harness
 
