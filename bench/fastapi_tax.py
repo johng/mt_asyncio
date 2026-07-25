@@ -57,18 +57,21 @@ whatever the handler does. Only part of that fixed cost is Python that
 parallelises. So the speedup is Amdahl's, and the two dials move the parallel
 fraction directly:
 
-  --lines N   order lines the handler aggregates (default 32)
-  --cpu N     extra CPU iterations burnt in the handler, `pg_tax.py`'s kernel
+  --lines N     order lines the handler aggregates (default 32)
+  --cpu N       units of extra CPU work in the handler
+  --cpu-kind K  what that work *is* -- and it changes the answer
 
-On this machine the default (a genuinely tiny handler) is 1.3-1.5x stdlib, and
-`--cpu 50000` is 6.35x. Neither is the "real" number; the curve is (see
-`bench/README.md`).
+``--cpu-kind churn`` (the default) is one small object built and read back
+through a property, two f-strings, a dict, and a ``json`` round trip per unit:
+allocation, and refcount traffic on objects every worker shares. ``burn`` is
+``pg_tax.py``'s ``x += i * i``, which allocates nothing and touches nothing
+shared. The second is the easiest work there is to parallelise and overstates
+the speedup by 20-25% at equal wall-clock weight, so it is kept for
+comparability with ``pg_tax.py`` rather than used by default.
 
-Prefer ``--lines`` when the answer matters. ``_burn`` is arithmetic on locals --
-it allocates nothing and touches no shared object, so it parallelises more
-easily than any real handler does; measured head to head it is worth 20-25% of
-apparent speedup over an allocating loop of the same weight. ``--cpu`` is the
-cheap dial and comparable with ``pg_tax.py``; ``--lines`` is the honest one.
+On this machine the default (a genuinely tiny handler) is 1.3-1.5x stdlib and a
+handler doing ~1ms of realistic work is around 5x. Neither is the "real" number;
+the curve is (see ``bench/README.md``).
 
 Setup::
 
@@ -83,7 +86,8 @@ Setup::
 Usage::
 
     python bench/fastapi_tax.py
-    python bench/fastapi_tax.py -w compute --threads 1 2 4 8 12 --cpu 20000
+    python bench/fastapi_tax.py -w compute --threads 1 2 4 8 12 --cpu 200
+    python bench/fastapi_tax.py -w compute --cpu 5000 --cpu-kind burn  # pg_tax's
     python bench/fastapi_tax.py -w compute raw --lines 512   # framework control
     python bench/fastapi_tax.py --arms stdlib mt --conns 32
     python bench/fastapi_tax.py --json bench/results/fastapi_tax.json
@@ -156,11 +160,68 @@ def build_fixture(lines: int) -> dict:
 
 
 def _burn(n):
-    """`pg_tax.py`'s CPU kernel, so a `--cpu` here means the same thing it does there."""
+    """`pg_tax.py`'s CPU kernel, so `--cpu-kind burn` means the same thing it does there.
+
+    Arithmetic on locals: no allocation, no shared object touched, nothing for
+    free-threading to contend on. That makes it the *easiest* work there is to
+    parallelise, and measurably so -- head to head against `_churn` below it is
+    worth 20-25% of apparent speedup at equal wall-clock weight. Kept because it
+    is the dial `pg_tax.py` uses and it is cheap to sweep; not the default.
+    """
     x = 0
     for i in range(n):
         x += i * i
     return x
+
+
+_TAGS = ('retail', 'wholesale', 'staff', 'trade')
+
+
+class _Line:
+    """A small object of the kind a handler makes and throws away per record."""
+
+    __slots__ = ('price', 'qty', 'sku')
+
+    def __init__(self, sku, qty, price):
+        self.sku = sku
+        self.qty = qty
+        self.price = price
+
+    @property
+    def amount(self):
+        return self.qty * self.price
+
+
+def _churn(n):
+    """The default CPU kernel: what handler code actually spends its time on.
+
+    One unit builds a small object, reads it back through a property, formats
+    two strings, builds a dict and round-trips it through `json`. So per unit it
+    allocates, refcounts objects shared across every worker (the class, the
+    module globals, the interned strings, `json`'s encoder) and returns them --
+    which is the part free-threading has to work for, and the part `_burn` skips
+    entirely.
+
+    It is not a claim about any particular application's mix. It is a claim that
+    a handler's CPU is object churn rather than arithmetic, so a benchmark dial
+    that is pure arithmetic will overstate what the runtime does for you.
+    """
+    total = 0
+    for i in range(n):
+        line = _Line(f'SKU-{i % 100000:05d}', 1 + i % 7, 100 + i % 9900)
+        record = {
+            'sku': line.sku,
+            'qty': line.qty,
+            'amount': line.amount,
+            'tag': _TAGS[i % len(_TAGS)],
+            'label': f'{line.sku}/{line.qty}',
+        }
+        blob = json.dumps(record)
+        total += len(blob) + json.loads(blob)['qty']
+    return total
+
+
+CPU_KINDS = {'churn': _churn, 'burn': _burn}
 
 
 def summarise(customer_id: int, rows) -> dict:
@@ -186,7 +247,7 @@ def summarise(customer_id: int, rows) -> dict:
     }
 
 
-def build_raw_app(lines: int, cpu: int):
+def build_raw_app(lines: int, cpu: int, cpu_kind: str = 'churn'):
     """The same handler work, reached without FastAPI. A control, not a proposal.
 
     `raw` answers the question the FastAPI numbers cannot: when the parallel
@@ -198,10 +259,9 @@ def build_raw_app(lines: int, cpu: int):
     graph a FastAPI request walks. Run both and the gap between their *scaling
     curves* is what the framework costs in parallel, as opposed to per request.
     """
-    import json as _json
-
     fixture = build_fixture(lines)
     head = [(b'content-type', b'application/json')]
+    kernel = CPU_KINDS[cpu_kind]
 
     async def app(scope, receive, send):
         path = scope['path']
@@ -209,24 +269,25 @@ def build_raw_app(lines: int, cpu: int):
             body = b'{"ok":true}'
         else:
             customer_id = int(path.rsplit('/', 1)[1])
-            body = _json.dumps(summarise(customer_id, fixture[customer_id % CUSTOMERS][:lines])).encode()
+            body = json.dumps(summarise(customer_id, fixture[customer_id % CUSTOMERS][:lines])).encode()
             if cpu:
-                _burn(cpu)
+                kernel(cpu)
         await send({'type': 'http.response.start', 'status': 200, 'headers': head})
         await send({'type': 'http.response.body', 'body': body})
 
     return app
 
 
-def build_app(workload: str, lines: int = LINES, cpu: int = 0, pool=None):
+def build_app(workload: str, lines: int = LINES, cpu: int = 0, cpu_kind: str = 'churn', pool=None):
     """The FastAPI app. Identical on every arm; only `pool` differs (pg only)."""
     if workload == 'raw':
-        return build_raw_app(lines, cpu)
+        return build_raw_app(lines, cpu, cpu_kind)
 
     from fastapi import FastAPI
     from pydantic import BaseModel
 
     fixture = build_fixture(lines)
+    kernel = CPU_KINDS[cpu_kind]
 
     class Summary(BaseModel):
         customer_id: int
@@ -254,7 +315,7 @@ def build_app(workload: str, lines: int = LINES, cpu: int = 0, pool=None):
                 rows = await cur.fetchall()
             result = summarise(customer_id, rows)
             if cpu:
-                _burn(cpu)
+                kernel(cpu)
             return result
 
     else:
@@ -264,7 +325,7 @@ def build_app(workload: str, lines: int = LINES, cpu: int = 0, pool=None):
             rows = fixture[customer_id % CUSTOMERS][:limit]
             result = summarise(customer_id, rows)
             if cpu:
-                _burn(cpu)
+                kernel(cpu)
             return result
 
     return app
@@ -542,7 +603,9 @@ async def _open_pool(dsn, size):
     return Pool(conns)
 
 
-def serve(arm: str, workload: str, port: int, threads: int, dsn: str, pool_size: int, lines: int, cpu: int) -> None:
+def serve(
+    arm: str, workload: str, port: int, threads: int, dsn: str, pool_size: int, lines: int, cpu: int, cpu_kind: str
+) -> None:
     """Run one server arm in the foreground until killed. Prints `READY <port>`."""
     if arm.startswith('mt'):
         import mt_asyncio.asyncio as maio
@@ -564,7 +627,7 @@ def serve(arm: str, workload: str, port: int, threads: int, dsn: str, pool_size:
 
     async def make_app():
         pool = await _open_pool(dsn, pool_size) if workload == 'pg' else None
-        return build_app(workload, lines=lines, cpu=cpu, pool=pool)
+        return build_app(workload, lines=lines, cpu=cpu, cpu_kind=cpu_kind, pool=pool)
 
     if arm.endswith('-uvicorn'):
         _serve_uvicorn(aio, make_app, port, threads)
@@ -739,7 +802,7 @@ CLIENTS = {'oha': _load_oha, 'python': _load_python}
 class Server:
     """A server arm in a subprocess, up and accepting by the time __enter__ returns."""
 
-    def __init__(self, arm, workload, threads, dsn, pool_size, port, lines, cpu):
+    def __init__(self, arm, workload, threads, dsn, pool_size, port, lines, cpu, cpu_kind):
         self.arm = arm
         self.workload = workload
         self.threads = threads
@@ -747,6 +810,7 @@ class Server:
         self.pool_size = pool_size
         self.lines = lines
         self.cpu = cpu
+        self.cpu_kind = cpu_kind
         self.port = port
         self.proc = None
         self.errlines = []
@@ -774,6 +838,8 @@ class Server:
                 str(self.lines),
                 '--cpu',
                 str(self.cpu),
+                '--cpu-kind',
+                self.cpu_kind,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -871,7 +937,7 @@ def _probe(url):
 
 def _measure(arm, workload, threads, args, client):
     port = _free_port()
-    server = Server(arm, workload, threads, args.dsn, args.conns, port, args.lines, args.cpu)
+    server = Server(arm, workload, threads, args.dsn, args.conns, port, args.lines, args.cpu, args.cpu_kind)
     with server:
         url = _url(workload, port, args.lines)
         try:
@@ -987,7 +1053,13 @@ def main():
         '--cpu',
         type=int,
         default=0,
-        help='extra CPU iterations burnt in the handler, `pg_tax.py`-style (0 = none)',
+        help='units of extra CPU work in the handler (0 = none)',
+    )
+    parser.add_argument(
+        '--cpu-kind',
+        choices=list(CPU_KINDS),
+        default='churn',
+        help="`churn` allocates and touches shared state (default, realistic); `burn` is pg_tax.py's arithmetic",
     )
     parser.add_argument('-n', '--requests', type=int, default=20000)
     parser.add_argument('-r', '--repeat', type=int, default=3)
@@ -1007,7 +1079,17 @@ def main():
     args = parser.parse_args()
 
     if args.serve:
-        serve(args.arm, args.workload[0], args.port, args.wthreads, args.dsn, args.pool_size, args.lines, args.cpu)
+        serve(
+            args.arm,
+            args.workload[0],
+            args.port,
+            args.wthreads,
+            args.dsn,
+            args.pool_size,
+            args.lines,
+            args.cpu,
+            args.cpu_kind,
+        )
         return
 
     if args.setup_db:
@@ -1049,7 +1131,7 @@ def main():
             (
                 f'- {args.requests} requests over {args.conns} keep-alive connections, client `{client_name}`, '
                 f'median of {args.repeat} run(s) after {args.warmup} warmup, '
-                f'{args.lines} lines per request, cpu={args.cpu}'
+                f'{args.lines} lines per request, cpu={args.cpu} ({args.cpu_kind})'
             ),
             '',
             'One hand-written HTTP/1.1 server, shared by every arm bar the `-uvicorn` ones;',

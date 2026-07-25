@@ -356,7 +356,8 @@ application was written for it.
 **But 1.51× is the floor of this benchmark, not its result** — see the next
 section before quoting it. The default handler is deliberately tiny, and a
 request that spends most of its time in fixed per-request cost has little for a
-second core to do.
+second core to do. Give the handler ~130 µs of ordinary work and it is 2.7×;
+past that it plateaus around **2.9×**, which is the figure to plan around.
 
 **The per-request floor is the price.** At one worker mt_asyncio serves 0.60× as
 many requests as stdlib on `compute` and 0.48× on `ping`, so it spends the first
@@ -390,85 +391,86 @@ efficiency cores are slower — this is the machine, not the runtimes.
 
 ### How much speedup should you expect? It depends entirely on the handler
 
-The table above answers "what if my handler does almost nothing?", and 1.5× is
+The table above answers "what if my handler does almost nothing?", and 1.5x is
 the honest answer to that question. It is not the answer to "what does this
 runtime do for a service that computes something", which is the question worth
-asking. `--cpu N` burns N iterations of `pg_tax.py`'s kernel in the handler and
-moves the parallel fraction directly (`--lines N` does the same, more gently, by
-lengthening the aggregate).
+asking. `--cpu N` adds N units of handler work; `--cpu-kind` decides what that
+work *is*, and it turns out to matter more than the amount.
 
-Same app, same server, same client; 32 connections, median of 3, **req/s**:
+The default kernel, `churn`, is one unit of ordinary handler CPU: a small object
+built and read back through a property, two f-strings, a dict, a `json` round
+trip. ~1.48 us per unit on this machine, so `--cpu 700` is a handler doing about
+a millisecond of real work. Same app, same server, 32 connections, median of 3,
+**req/s**:
 
-| `--cpu` | arm | 1t | 2t | 4t | 8t | 12t | best vs stdlib |
+| `--cpu` (churn) | arm | 1t | 2t | 4t | 8t | 12t | best vs stdlib |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | `stdlib` | 23,303 | · | · | · | · | 1.00× |
-| | `mt` | 14,389 | 23,053 | **30,456** | 29,784 | 24,833 | 1.31× |
-| | `tonio` | 25,776 | 32,603 | **41,020** | 33,243 | 26,020 | 1.76× |
-| 5,000 | `stdlib` | 7,988 | · | · | · | · | 1.00× |
-| | `mt` | 6,677 | 11,743 | 20,310 | **22,542** | 22,415 | 2.82× |
-| | `tonio` | 8,076 | 13,360 | 22,407 | **24,872** | 24,394 | 3.11× |
-| 20,000 | `stdlib` | 2,590 | · | · | · | · | 1.00× |
-| | `mt` | 2,404 | 4,683 | 8,812 | 11,192 | **12,376** | 4.78× |
-| | `tonio` | 2,571 | 5,047 | 8,950 | 11,892 | **13,523** | 5.22× |
-| 50,000 | `stdlib` | 1,030 | · | · | · | · | 1.00× |
-| | `mt` | 1,038 | 2,066 | 3,851 | 5,344 | **6,538** | **6.35×** |
-| | `tonio` | 1,080 | 2,120 | 3,835 | 5,283 | **5,993** | 5.82× |
+| 0 | `stdlib` | 22,970 | · | · | · | · | 1.00x |
+| | `mt` | 14,232 | 22,616 | **34,994** | 29,920 | 25,189 | 1.52x |
+| | `tonio` | 24,579 | 32,481 | **40,978** | 33,613 | 25,245 | 1.78x |
+| 85 (~126 us) | `stdlib` | 5,453 | · | · | · | · | 1.00x |
+| | `mt` | 4,564 | 7,360 | 12,166 | 13,734 | **14,602** | 2.68x |
+| | `tonio` | 5,413 | 8,000 | 12,666 | 14,220 | **15,247** | 2.80x |
+| 315 (~466 us) | `stdlib` | 1,783 | · | · | · | · | 1.00x |
+| | `mt` | 1,662 | 2,390 | 4,283 | 4,573 | **5,220** | 2.93x |
+| | `tonio` | 1,771 | 2,506 | 4,428 | 4,611 | **5,286** | 2.96x |
+| 700 (~1.04 ms) | `stdlib` | 857 | · | · | · | · | 1.00x |
+| | `mt` | 820 | 1,141 | 2,049 | 2,146 | **2,430** | 2.83x |
+| | `tonio` | 851 | 1,143 | 2,056 | 2,115 | **2,438** | 2.85x |
 
-**1.31× → 6.35×, and the mechanism is visible in the 1t column.** mt_asyncio's
-one-worker throughput goes from 0.62× stdlib at `--cpu 0` to 0.84×, 0.93× and
-finally 1.01× — its fixed per-request overhead is constant, so the more the
-handler does, the less that overhead is worth. At `--cpu 0` the first two
-workers are spent buying it back and only the third and fourth are profit; by
-`--cpu 50000` there is nothing to buy back and all twelve are profit, for 6.3×
-self-scaling (1,038 → 6,538). That is the same order as `asyncio_bench.py`'s
-7.34× on CPU-between-awaits, which is the ceiling this converges on once HTTP
-stops dominating.
+**It climbs, and then it stops.** 1.52x at nothing, 2.68x at ~126 us of handler
+work, and then a plateau: 2.93x, 2.83x. Past a few hundred microseconds, adding
+more work to the handler buys nothing. **~2.9x is the number to plan around** for
+a FastAPI service on this machine, and 12 workers is what it takes to get it.
 
-**More thread is not always more.** At `--cpu 0` both parallel arms peak at 4
-workers and lose ground by 12; at `--cpu 50000` both are still climbing at 12.
-The knee moves right as the handler gets heavier, because coordination is a fixed
-cost per request and there is more work to hide it behind.
+That plateau is not the runtime running out of road, and the way to see it is to
+change nothing but the *kind* of work. `--cpu-kind burn` is `pg_tax.py`'s
+`x += i * i`: identical wall-clock weight, but no allocation and no shared object
+touched. Sampling the server process during a run, at weights matched to ~1 ms:
 
-**`--cpu 50000` is also where mt_asyncio finally passes TonIO** (6,538 vs 5,993).
-TonIO leads everywhere the per-operation cost dominates — that is the asyncio
-layer, priced in `tonio_regression.py` — and the lead disappears once the
-handler, which both runtimes step identically, is the bulk of the request.
+| kernel | workers | server CPU | req/s | vs 1 worker |
+| --- | --- | --- | --- | --- |
+| `churn` (allocates) | 1 | 99% | 836 | 1.00x |
+| | 4 | 398% | 2,020 | 2.42x |
+| | 12 | **1168%** | 2,379 | **2.85x** |
+| `burn` (arithmetic) | 1 | 98% | 1,019 | 1.00x |
+| | 4 | 396% | 3,499 | 3.43x |
+| | 12 | **1148%** | 5,193 | **5.09x** |
 
-**`--cpu` flatters, so treat those figures as an upper bound.** `_burn` is
-arithmetic on locals: it allocates nothing and touches no shared object, which is
-the easiest thing free-threading can be asked to parallelise. `--lines` is the
-realistic dial — a loop over tuples building dicts and strings, looking up shared
-classes. Matched against each other (32 connections, median of 3):
+**The machine gives both the same eleven and a half cores. One converts them into
+5.09x and the other into 2.85x.** The CPU is being spent either way -- the
+threads are not blocked, not starved, not waiting on the loop -- so what
+separates them is what allocating, refcounted, shared-object Python costs when
+twelve threads do it at once. That is free-threaded CPython's bill, not
+mt_asyncio's, and no scheduler change collects it.
 
-| work added per request | arm | 1t | 4t | 8t | 12t | best vs stdlib |
-| --- | --- | --- | --- | --- | --- | --- |
-| ~93 µs, `--lines 2048` (allocating) | `stdlib` | 7,205 | · | · | · | 1.00× |
-| | `mt` | 6,312 | 15,653 | 17,125 | **17,265** | 2.40× |
-| | `tonio` | 7,603 | 16,209 | **18,330** | 16,035 | 2.54× |
-| ~126 µs, `--cpu 5000` (arithmetic) | `stdlib` | 7,692 | · | · | · | 1.00× |
-| | `mt` | 6,383 | 20,278 | 20,314 | **22,533** | 2.93× |
-| | `tonio` | 8,052 | 22,393 | **24,976** | 24,575 | 3.25× |
+Which is why `burn` is not the default and its numbers are not quoted here: a
+pure-arithmetic dial reports 6.35x for a workload whose realistic twin does 2.83x.
+`asyncio_bench.py`'s 7.34x on CPU-between-awaits is the same kind of kernel and
+should be read the same way -- as the runtime's ceiling with contention removed,
+not as a forecast for application code.
 
-The synthetic loop adds *more* work and still scales better — 2.93× against
-2.40× for mt_asyncio, 3.25× against 2.54× for TonIO. So roughly 20-25% of the
-`--cpu` column is the kernel being unusually friendly to parallelism, and a real
-handler of the same weight should be expected nearer the `--lines` row. The
-shape of the argument is unchanged; the top of the range is not a promise.
+**mt_asyncio and TonIO converge as the handler grows** -- 2.83x against 2.85x at
+`--cpu 700`, from 1.52x against 1.78x at zero. TonIO's lead is per-operation
+cost in the asyncio layer, and it stops mattering once both runtimes are mostly
+stepping the same Python.
 
-### It is not the framework
+### It is not the framework either
 
-The obvious suspicion about a 1.5× is that FastAPI is the bottleneck — all that
-shared routing and validation state, refcounted across cores. The `raw` workload
-is the control: identical `summarise` over identical rows, identical JSON out,
-reached by a dict lookup instead of starlette routing and pydantic validation.
+If the ceiling is shared-object contention, FastAPI is the obvious suspect — all
+that routing and validation state, refcounted across twelve cores. It is not, and
+`raw` is the control that says so: identical `summarise` over identical rows,
+identical JSON out, reached by a dict lookup instead of starlette routing and
+pydantic validation.
 
 At `--lines 2048` it scales 8,089 → 18,394 req/s from 1 to 4 workers (2.27×)
 against FastAPI's 6,637 → 15,793 (2.38×). **The same curve.** FastAPI costs
-throughput per request; it does not cost scaling. Whatever caps the speedup is
-underneath both.
+throughput per request — a lot of it — but it does not cost scaling. Ordinary
+Python object churn in the handler is enough to hit the ceiling on its own; the
+framework just adds more of the same.
 
-Sampling the server process during a run says what that is — the cores are
-there, but each one delivers less (`mt`, `compute`, `--lines 2048`, 15s runs):
+The per-worker efficiency decay is visible from the second worker onwards, well
+inside the 6 performance cores (`mt`, `compute`, `--lines 2048`, 15s runs):
 
 | workers | server CPU | req/s | req/s per core | efficiency |
 | --- | --- | --- | --- | --- |
@@ -477,12 +479,9 @@ there, but each one delivers less (`mt`, `compute`, `--lines 2048`, 15s runs):
 | 4 | 369% | 14,874 | 4,033 | 62% |
 | 8 | 555% | 17,383 | 3,130 | 48% |
 
-The client is not competing for them — `oha` sampled at 34% of one core against
-the server's 513%. The efficiency loss starts at 2 workers, on a machine with 6
-performance cores, so it is not core starvation either. It is the per-request
-coordination that a socket read, a reactor wakeup and a cross-thread task step
-cost, and `--cpu` works precisely because it gives that coordination more work to
-amortise against.
+The client is not competing for the cores — `oha` sampled at 34% of one against
+the server's 513% — and the loss starts too early to be the efficiency cores. It
+is the same bill as above, paid per request instead of per handler.
 
 ### The server is not a strawman
 
@@ -529,8 +528,15 @@ the survivors towards the lucky ones. Losses above 1% fail the measurement.
 - **Client and server share the box.** `oha` is native and cheap next to the
   Python server, but it is not free, and it competes for the same 6 performance
   cores at the higher thread counts.
+- **`--cpu-kind burn` is not a forecast.** It exists for comparability with
+  `pg_tax.py` and it reports roughly double the speedup of `churn` at the same
+  wall-clock weight, because arithmetic on locals is the one thing free-threading
+  never has to contend over. Quote `churn`.
 - Run-to-run spread on this machine was under ~10% for most cells; the JSON keeps
   every sample plus the spread, so a suspicious number can be checked.
+- **mt_asyncio's connection loss gets worse with load.** At `--cpu 700`/12
+  workers the `!n` markers appear in most runs rather than a minority of them.
+  Same defect as below, more of it.
 
 ## 5. `benchmarks.py` + `runbench.sh` — subprocess harness
 
