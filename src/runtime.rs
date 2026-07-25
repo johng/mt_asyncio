@@ -32,7 +32,7 @@ pub struct RuntimeState {
     sig_sock: (socket2::Socket, socket2::Socket),
 }
 
-#[pyclass(frozen, subclass, module = "tonio._tonio")]
+#[pyclass(frozen, subclass, module = "mt_asyncio._mt_asyncio")]
 pub struct Runtime {
     io_registrations: papaya::HashMap<usize, Arc<ScheduledIO>>,
     io_registry: arc_swap::ArcSwapOption<mio::Registry>,
@@ -118,12 +118,25 @@ impl Runtime {
                     let ready = readiness_from_event(event);
                     io.set_readiness(ready);
                     //: wake and schedule work
-                    let (reader, writer) = io.wake(ready);
-                    if let Some(ev) = reader {
+                    let woken = io.wake(ready);
+                    if let Some(ev) = woken.reader {
                         self.add_io_handle(Box::new(ev));
                     }
-                    if let Some(ev) = writer {
+                    if let Some(ev) = woken.writer {
                         self.add_io_handle(Box::new(ev));
+                    }
+                    //: native readiness callbacks run inline here — the poll
+                    //  thread already holds the GIL, so the asyncio-compat loop
+                    //  gets woken with a single cross-thread hop
+                    if let Some(cb) = woken.reader_cb
+                        && let Err(err) = cb.call0(py)
+                    {
+                        err.write_unraisable(py, None);
+                    }
+                    if let Some(cb) = woken.writer_cb
+                        && let Err(err) = cb.call0(py)
+                    {
+                        err.write_unraisable(py, None);
                     }
                 }
             }
@@ -170,12 +183,19 @@ impl Runtime {
                 _ = registry.deregister(&mut source);
             }
             //: shutdown any leftofer work
-            let (reader, writer) = io.shutdown();
-            if let Some(ev) = reader {
+            let woken = io.shutdown();
+            if let Some(ev) = woken.reader {
                 self.add_io_handle(Box::new(ev));
             }
-            if let Some(ev) = writer {
+            if let Some(ev) = woken.writer {
                 self.add_io_handle(Box::new(ev));
+            }
+            //: no GIL here — schedule pending callbacks onto a worker to fire
+            if let Some(cb) = woken.reader_cb {
+                self.add_io_handle(Box::new(crate::handles::CallbackHandle(cb)));
+            }
+            if let Some(cb) = woken.writer_cb {
+                self.add_io_handle(Box::new(crate::handles::CallbackHandle(cb)));
             }
             //: add to the release queue
             self.io_pending_release.lock().unwrap().push(io.clone());
@@ -183,15 +203,20 @@ impl Runtime {
         }
     }
 
-    fn stop_threads(&self, cond: Arc<(Mutex<usize>, Condvar)>) {
+    fn stop_threads(&self, py: Python, cond: Arc<(Mutex<usize>, Condvar)>) {
         self.work_stopping.store(true, atomic::Ordering::Release);
         if let Some(sched) = self.work_schedule.load_full() {
             for unparker in &sched.unparkers {
                 unparker.unpark();
             }
         }
-        let (lock, cvar) = &*cond;
-        let _guard = cvar.wait_while(lock.lock().unwrap(), |pending| *pending > 0);
+        //: detach before blocking: a worker draining its last handles may need a
+        //  stop-the-world pause (cyclic GC), which never completes while this
+        //  thread sits attached in the condvar — deadlocking shutdown
+        py.detach(|| {
+            let (lock, cvar) = &*cond;
+            let _guard = cvar.wait_while(lock.lock().unwrap(), |pending| *pending > 0);
+        });
     }
 
     #[inline(always)]
@@ -280,7 +305,7 @@ impl Runtime {
     fn teardown(&self, py: Python, state: &mut RuntimeState, threads_cvar: Arc<(Mutex<usize>, Condvar)>) {
         _ = self.drop_sig_socket(py, state);
         self.cleanup_io(state);
-        self.stop_threads(threads_cvar);
+        self.stop_threads(py, threads_cvar);
         self.work_schedule.swap(None);
         self.waker.swap(None);
         self.io_registry.swap(None);
@@ -379,6 +404,14 @@ impl Runtime {
         Instant::now().duration_since(self.epoch).as_micros()
     }
 
+    //: whether the runtime propagates `contextvars` into coroutines. The
+    //  asyncio loop needs this (current_task/get_running_loop are contextvars)
+    //  and checks it before reusing a runtime it did not create.
+    #[getter(_context)]
+    fn _get_context(&self) -> bool {
+        self.use_pyctx
+    }
+
     #[getter(_closed)]
     fn _get_closed(&self) -> bool {
         self.closed.load(atomic::Ordering::Acquire)
@@ -446,28 +479,37 @@ impl Runtime {
         self.ssock_w.swap(val.into());
     }
 
-    fn _spawn_pygen(&self, py: Python, coro: Py<PyAny>) {
+    //: schedule a native coroutine onto the runtime. In `context` mode the
+    //  current `contextvars` context is copied here, once per spawn, and every
+    //  subsequent step of the coroutine runs inside it.
+    fn _spawn_coro(&self, py: Python, coro: Py<PyAny>) {
         if self.use_pyctx {
             let ctx = unsafe {
                 let ret = pyo3::ffi::PyContext_CopyCurrent();
                 Bound::from_owned_ptr(py, ret).unbind()
             };
-            self.add_handle(Box::new(crate::handles::PyGenCtxHandle::new(py, coro, ctx)));
+            self.add_handle(Box::new(crate::handles::PyCoroCtxHandle::new(py, coro, ctx)));
             return;
         }
-        self.add_handle(Box::new(crate::handles::PyGenHandle::new(py, coro)));
+        self.add_handle(Box::new(crate::handles::PyCoroHandle::new(py, coro)));
     }
 
-    fn _spawn_pyasyncgen(&self, py: Python, coro: Py<PyAny>) {
-        if self.use_pyctx {
-            let ctx = unsafe {
-                let ret = pyo3::ffi::PyContext_CopyCurrent();
-                Bound::from_owned_ptr(py, ret).unbind()
-            };
-            self.add_handle(Box::new(crate::handles::PyAsyncGenCtxHandle::new(py, coro, ctx)));
-            return;
-        }
-        self.add_handle(Box::new(crate::handles::PyAsyncGenHandle::new(py, coro)));
+    //: schedule a zero-argument Python callable to run once on a worker thread.
+    //  Thread-safe from any thread (add_handle uses the global injector off-worker).
+    //  Cheaper than _spawn_coro for a plain callback: one CallbackHandle, no
+    //  coroutine object and no per-call context copy (the caller wraps context).
+    fn _call_soon(&self, callback: Py<PyAny>) {
+        self.add_handle(Box::new(crate::handles::CallbackHandle(callback)));
+    }
+
+    //: like `_call_soon`, but always onto the global queue rather than the
+    //  calling worker's local deque. `find_work` pops the local deque first, so
+    //  a handle that re-schedules itself -- the add_reader re-arm, when its
+    //  callback does not drain the fd -- would be popped straight back off and
+    //  loop on that worker forever, never yielding to the wake handles sitting
+    //  in the injector. With as many such fds as workers, nothing else runs.
+    fn _call_soon_deferred(&self, callback: Py<PyAny>) {
+        self.defer_handle(Box::new(crate::handles::CallbackHandle(callback)));
     }
 
     #[pyo3(signature = (f, *args, **kwargs))]

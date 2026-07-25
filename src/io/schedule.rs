@@ -27,6 +27,20 @@ fn tick_of(word: usize) -> u8 {
 struct Waiters {
     reader: Option<Py<Event>>,
     writer: Option<Py<Event>>,
+    //: native readiness callbacks (used by the asyncio-compat loop): invoked
+    //  inline on the poll thread when the direction becomes ready, avoiding the
+    //  extra reactor->worker->consumer hop of the Event/Waiter path
+    reader_cb: Option<Py<PyAny>>,
+    writer_cb: Option<Py<PyAny>>,
+}
+
+//: whatever was parked on a direction that just became ready: Event waiters
+//  (scheduled onto workers) and/or native callbacks (invoked with the GIL held)
+pub(crate) struct WakeSet {
+    pub(crate) reader: Option<Py<Event>>,
+    pub(crate) writer: Option<Py<Event>>,
+    pub(crate) reader_cb: Option<Py<PyAny>>,
+    pub(crate) writer_cb: Option<Py<PyAny>>,
 }
 
 //: per-fd persistent I/O state. The fd is registered with the poller once for
@@ -82,6 +96,30 @@ impl ScheduledIO {
         Ok(Some(event))
     }
 
+    //: like `arm`, but stores a native Python callback instead of allocating an
+    //  Event/Waiter. Returns true if the direction is already ready (callback
+    //  NOT stored — the caller should perform the syscall), false if the
+    //  callback was registered and will fire on the next readiness edge.
+    #[inline]
+    fn arm_cb(&self, mask: usize, cb: Py<PyAny>) -> bool {
+        if self.readiness.load(atomic::Ordering::Acquire) & (mask | SHUTDOWN) != 0 {
+            return true;
+        }
+        let mut slots = self.waiters.lock().unwrap();
+        //: re-check under the lock, mirroring `arm`: either we observe the bits
+        //  here or `wake` observes our slot
+        if self.readiness.load(atomic::Ordering::Acquire) & (mask | SHUTDOWN) != 0 {
+            return true;
+        }
+        let slot = if mask & READABLE != 0 {
+            &mut slots.reader_cb
+        } else {
+            &mut slots.writer_cb
+        };
+        *slot = Some(cb);
+        false
+    }
+
     // NOTE: closed states are cleared as well, since a genuinely closed direction never
     //       returns EWOULDBLOCK (recv gives EOF/reset, send gives EPIPE).
     //       A closed bit observed here is stale — epoll reports EPOLLHUP for fresh
@@ -122,22 +160,27 @@ impl ScheduledIO {
             });
     }
 
-    pub(crate) fn wake(&self, ready: usize) -> (Option<Py<Event>>, Option<Py<Event>>) {
+    pub(crate) fn wake(&self, ready: usize) -> WakeSet {
         let mut slots = self.waiters.lock().unwrap();
-        let reader = if ready & READ_ALL != 0 {
-            slots.reader.take()
+        let (reader, reader_cb) = if ready & READ_ALL != 0 {
+            (slots.reader.take(), slots.reader_cb.take())
         } else {
-            None
+            (None, None)
         };
-        let writer = if ready & WRITE_ALL != 0 {
-            slots.writer.take()
+        let (writer, writer_cb) = if ready & WRITE_ALL != 0 {
+            (slots.writer.take(), slots.writer_cb.take())
         } else {
-            None
+            (None, None)
         };
-        (reader, writer)
+        WakeSet {
+            reader,
+            writer,
+            reader_cb,
+            writer_cb,
+        }
     }
 
-    pub(crate) fn shutdown(&self) -> (Option<Py<Event>>, Option<Py<Event>>) {
+    pub(crate) fn shutdown(&self) -> WakeSet {
         self.readiness.fetch_or(SHUTDOWN, atomic::Ordering::AcqRel);
         self.wake(READ_ALL | WRITE_ALL)
     }
@@ -161,6 +204,25 @@ impl ScheduledIO {
                 Ok(None)
             }
         }
+    }
+
+    //: callback-based arm for the asyncio-compat loop (see `arm_cb`). Mirrors
+    //  `arm_r`/`arm_w`: returns true if already ready (do the syscall now),
+    //  false if the callback was registered.
+    pub(crate) fn arm_r_cb(&self, cb: Py<PyAny>) -> bool {
+        if self.arm_cb(READ_ALL, cb) {
+            self.tick_r.store(self.current_tick(), atomic::Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn arm_w_cb(&self, cb: Py<PyAny>) -> bool {
+        if self.arm_cb(WRITE_ALL, cb) {
+            self.tick_w.store(self.current_tick(), atomic::Ordering::Release);
+            return true;
+        }
+        false
     }
 
     pub(crate) fn clear_r(&self) {

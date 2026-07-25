@@ -1,9 +1,9 @@
-# TonIO benchmarks
+# mt_asyncio benchmarks
 
 Run at: {{ =datetime.datetime.fromtimestamp(data.run_at).strftime('%a %d %b %Y, %H:%M') }}    
 Environment: {{ =benv }} (CPUs: {{ =data.cpu }})    
 Python version: {{ =data.pyver }}    
-TonIO version: {{ =data.tonio }}    
+mt_asyncio version: {{ =data.mt_asyncio }}    
 
 ### Running 1 million coroutines
 

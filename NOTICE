@@ -1,0 +1,100 @@
+# Third-party notices
+
+mt_asyncio is a derivative work and bundles compiled third-party code in its wheels.
+This file records what it is derived from and which licenses travel with a
+distribution. It is informational; the authoritative terms are each project's
+own license text.
+
+## 1. TonIO — BSD-3-Clause (the code mt_asyncio is derived from)
+
+    Copyright 2025 Giovanni Barillari
+    https://github.com/gi0baro/tonio
+
+mt_asyncio began as a fork of TonIO and retains its runtime core (the Rust scheduler,
+reactor, event/waiter primitives and blocking pool). TonIO's BSD-3-Clause notice
+is reproduced in `LICENSE`, which covers this project as a whole.
+
+Obligations carried by that license:
+
+* keep the copyright notice, license text and disclaimer in source
+  distributions, and reproduce them in the documentation of binary
+  distributions (clauses 1 and 2);
+* do not use the name of the copyright holder or its contributors to endorse or
+  promote mt_asyncio without written permission (clause 3). Stating that mt_asyncio is
+  *derived from* TonIO is a factual statement and is fine; implying that TonIO
+  or its authors endorse, sponsor or maintain mt_asyncio is not.
+
+Summary of changes made to the original: the `yield`-based and `async`-native
+public APIs (`tonio`, `tonio.colored`, and the `net`/`sync`/`scope`/`signals`
+modules built on them) were removed along with their Rust support (generator
+handles and suspensions, `PyGenScope`/`PyAsyncGenScope`, the Rust `sync` and
+`net` modules); an asyncio-compatible event loop was added; and the shutdown
+path was fixed to detach from the interpreter before joining worker threads.
+
+## 2. CPython — PSF License Agreement (Python Software Foundation License 2.0)
+
+    Copyright (c) 2001-2026 Python Software Foundation; All Rights Reserved
+    https://github.com/python/cpython
+
+The following modules are ports of CPython's `asyncio` implementation and are
+therefore covered by the PSF License Agreement in addition to this project's
+license:
+
+* `mt_asyncio/asyncio/_tg.py`        — from `Lib/asyncio/taskgroups.py`
+* `mt_asyncio/asyncio/_timeouts.py`  — from `Lib/asyncio/timeouts.py`
+
+Other modules in `mt_asyncio/asyncio` re-implement asyncio semantics without copying
+CPython source. Each ported file carries a header stating its origin and the
+changes made, as the PSF License requires (clause 3: retain PSF's copyright
+notice and include "a brief summary of the changes made to Python").
+
+## 3. Rust dependencies
+
+Linked into the published wheels:
+
+| Crate | License |
+| --- | --- |
+| pyo3, pyo3-ffi | MIT OR Apache-2.0 |
+| mio | MIT |
+| crossbeam-channel, crossbeam-deque, crossbeam-epoch, crossbeam-utils | MIT OR Apache-2.0 |
+| socket2 | MIT OR Apache-2.0 |
+| anyhow | MIT OR Apache-2.0 |
+| arc-swap | MIT OR Apache-2.0 |
+| papaya, seize | MIT |
+| libc | MIT OR Apache-2.0 |
+| once_cell, portable-atomic, log | MIT OR Apache-2.0 |
+| mimalloc / libmimalloc-sys (optional feature) | MIT |
+| tikv-jemallocator / tikv-jemalloc-sys (optional feature) | MIT OR Apache-2.0 |
+
+Build-time only — proc-macro expansion and build scripts, compiled for the host
+and not linked into the shipped binary:
+
+| Crate | License |
+| --- | --- |
+| pyo3-macros, pyo3-macros-backend, pyo3-build-config | MIT OR Apache-2.0 |
+| syn, quote, proc-macro2, heck, rustversion, equivalent | MIT OR Apache-2.0 |
+| cc, shlex | MIT OR Apache-2.0 |
+| unicode-ident | (MIT OR Apache-2.0) AND Unicode-3.0 |
+| target-lexicon | Apache-2.0 WITH LLVM-exception |
+
+Present in `Cargo.lock` but never compiled for the platforms released here
+(Linux and macOS): `windows-link` and `windows-sys` (MIT OR Apache-2.0),
+`find-msvc-tools` (MIT OR Apache-2.0), and `wasi` (Apache-2.0 WITH
+LLVM-exception OR Apache-2.0 OR MIT).
+
+All are permissive. MIT requires that its copyright notice and permission
+notice ship with substantial portions of the software, which for a wheel means
+including the license texts; Apache-2.0 additionally requires passing along any
+upstream `NOTICE` file and carries an explicit patent grant. Where a crate is
+dual-licensed, mt_asyncio takes the MIT option, which is compatible with
+BSD-3-Clause. Two build-time crates are exceptions to that: `target-lexicon`
+offers only Apache-2.0 WITH LLVM-exception, and `unicode-ident` applies the
+Unicode-3.0 terms in addition to whichever of MIT/Apache-2.0 is chosen (the
+license is conjunctive). Neither is linked into a wheel. Regenerate the exact
+set with `cargo license` or `cargo about generate` before publishing a release.
+
+## 4. Names
+
+"TonIO" and "Python" are used here only to identify the projects mt_asyncio derives
+from and targets. mt_asyncio is not affiliated with, endorsed by, or supported by
+either project.

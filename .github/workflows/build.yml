@@ -100,7 +100,7 @@ jobs:
           uv python install ${{ env.UV_PYTHON }}
           uv venv .venv
           uv sync --no-install-project --group test
-          uv pip install tonio --no-index --no-deps --find-links pgo_wheel --force-reinstall
+          uv pip install mt_asyncio --no-index --no-deps --find-links pgo_wheel --force-reinstall
           LLVM_PROFILE_FILE=${{ github.workspace }}/profdata/ton_%m_%p.profraw uv run --no-sync pytest tests
       - name: merge PGO data
         run: ${{ env.LLVM_PROFDATA }} merge --failure-mode=all -o ${{ github.workspace }}/merged.profdata ${{ github.workspace }}/profdata

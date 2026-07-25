@@ -97,10 +97,6 @@ impl WorkSchedule {
     }
 }
 
-pub struct WorkerState {
-    pub read_buf: Box<[u8]>,
-}
-
 pub(crate) fn find_work(
     worker: &Worker<BoxedHandle>,
     injector: &Injector<BoxedHandle>,
@@ -143,9 +139,6 @@ pub(crate) fn work_loop(
     cond: Arc<(Mutex<usize>, Condvar)>,
 ) {
     LOCAL_WORKER.with(|c| c.set(&raw const worker));
-    let mut state = WorkerState {
-        read_buf: vec![0; 262_144].into_boxed_slice(),
-    };
 
     Python::attach(|py| {
         let rself = runtime.get();
@@ -159,7 +152,7 @@ pub(crate) fn work_loop(
                         scheduler.unpark_one();
                     }
                 }
-                handle.run(py, &runtime, &mut state);
+                handle.run(py, &runtime);
                 continue;
             }
             if rself.work_stopping.load(atomic::Ordering::Acquire) {
@@ -183,7 +176,7 @@ pub(crate) fn work_loop(
                         scheduler.unpark_one();
                     }
                 }
-                handle.run(py, &runtime, &mut state);
+                handle.run(py, &runtime);
                 continue;
             }
             if rself.work_stopping.load(atomic::Ordering::Acquire) {
@@ -213,7 +206,7 @@ pub(crate) fn work_loop(
                         //: as before, absorb the speculation token if the flag was claimed
                         scheduler.speculation.fetch_sub(1, atomic::Ordering::AcqRel);
                     }
-                    handle.run(py, &runtime, &mut state);
+                    handle.run(py, &runtime);
                     continue;
                 }
             }

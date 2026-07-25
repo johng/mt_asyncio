@@ -122,6 +122,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt_asyncio"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "crossbeam-channel",
+ "crossbeam-deque",
+ "crossbeam-utils",
+ "libc",
+ "mimalloc",
+ "mio",
+ "papaya",
+ "pyo3",
+ "pyo3-build-config",
+ "socket2",
+ "tikv-jemallocator",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,25 +305,6 @@ checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
 dependencies = [
  "libc",
  "tikv-jemalloc-sys",
-]
-
-[[package]]
-name = "tonio"
-version = "0.8.3"
-dependencies = [
- "anyhow",
- "arc-swap",
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-utils",
- "libc",
- "mimalloc",
- "mio",
- "papaya",
- "pyo3",
- "pyo3-build-config",
- "socket2",
- "tikv-jemallocator",
 ]
 
 [[package]]

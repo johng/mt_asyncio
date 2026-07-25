@@ -7,5 +7,5 @@ __pycache__
 .venv*
 .vscode
 
-tonio/*.so
+mt_asyncio/*.so
 target/*

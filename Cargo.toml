@@ -1,24 +1,25 @@
 [package]
-name = "tonio"
-version = "0.8.3"
-description = "A multi-threaded async runtime"
-authors = ["Giovanni Barillari <g@baro.dev>"]
+name = "mt_asyncio"
+version = "0.1.0-alpha.1"
+description = "A parallel asyncio runtime for free-threaded Python"
+authors = ["John Griffith <john.griffith243@gmail.com>"]
 license = "BSD-3-Clause"
 edition = "2024"
 
-keywords = ["async", "io", "threading", "networking"]
+keywords = ["asyncio", "async", "io", "threading", "networking"]
 
 readme = "README.md"
-homepage = "https://github.com/gi0baro/tonio"
-repository = "https://github.com/gi0baro/tonio"
+homepage = "https://github.com/johng/mt_asyncio"
+repository = "https://github.com/johng/mt_asyncio"
 
 include = [
     "/Cargo.toml",
     "/pyproject.toml",
     "/LICENSE",
+    "/NOTICE",
     "/README.md",
     "/src",
-    "/tonio",
+    "/mt_asyncio",
     "/tests",
     "!__pycache__",
     "!tests/.pytest_cache",
@@ -26,7 +27,7 @@ include = [
 ]
 
 [lib]
-name = "_tonio"
+name = "_mt_asyncio"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

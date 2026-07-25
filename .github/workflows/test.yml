@@ -4,10 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize]
     branches:
-      - master
+      - main
   push:
     branches:
-      - master
+      - main
 
 jobs:
   linux:

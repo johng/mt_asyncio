@@ -1,11 +1,18 @@
 .DEFAULT_GOAL := all
-pysources = tonio tests
+pysources = mt_asyncio tests
 
 .PHONY: build-dev
 build-dev:
-	@rm -f tonio/*.so
+	@rm -f mt_asyncio/*.so
 	uv sync --group all
 	maturin develop --uv
+
+# benchmarks MUST run against this, not build-dev: a debug build is several
+# times slower and the bench scripts refuse to run on one
+.PHONY: build-release
+build-release:
+	@rm -f mt_asyncio/*.so
+	maturin develop --uv --release
 
 .PHONY: format
 format:
@@ -54,6 +61,21 @@ lint: lint-python lint-rust
 .PHONY: test
 test:
 	pytest -v tests
+
+# stdlib asyncio vs mt_asyncio.asyncio, same coroutines under both loops.
+# BENCH_ARGS passes through, e.g. `make bench BENCH_ARGS="-w mixed --threads 1 8"`
+.PHONY: bench
+bench:
+	python bench/asyncio_bench.py --json bench/results/asyncio.json $(BENCH_ARGS)
+
+.PHONY: bench-quick
+bench-quick:
+	python bench/asyncio_bench.py --scale 0.1 --repeat 1 --warmup 0 --threads 1 4 $(BENCH_ARGS)
+
+# mt_asyncio vs upstream TonIO from PyPI: has the shared Rust core regressed?
+.PHONY: bench-regression
+bench-regression:
+	python bench/tonio_regression.py --json bench/results/regression.json $(BENCH_ARGS)
 
 .PHONY: all
 all: format build-dev lint test

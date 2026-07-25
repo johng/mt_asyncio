@@ -6,7 +6,7 @@ use super::schedule::ScheduledIO;
 use crate::events::Waiter;
 
 //: raw-fd registration handle for consumers that perform their own I/O
-#[pyclass(frozen, subclass, name = "ScheduledIO", module = "tonio._tonio")]
+#[pyclass(frozen, subclass, name = "ScheduledIO", module = "mt_asyncio._mt_asyncio")]
 struct PyScheduledIO {
     io: Arc<ScheduledIO>,
 }
@@ -30,12 +30,30 @@ impl PyScheduledIO {
         self.io.arm_w(py, timeout)
     }
 
+    //: register a native readiness callback (fired inline on the poll thread).
+    //  Returns True if the direction is already ready (callback not stored).
+    fn _arm_r_cb(&self, cb: Py<PyAny>) -> bool {
+        self.io.arm_r_cb(cb)
+    }
+
+    fn _arm_w_cb(&self, cb: Py<PyAny>) -> bool {
+        self.io.arm_w_cb(cb)
+    }
+
     fn consume_r(&self) -> bool {
         self.io.consume_r()
     }
 
     fn consume_w(&self) -> bool {
         self.io.consume_w()
+    }
+
+    fn clear_r(&self) {
+        self.io.clear_r();
+    }
+
+    fn clear_w(&self) {
+        self.io.clear_w();
     }
 
     fn close(&self, py: Python) {

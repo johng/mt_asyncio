@@ -7,7 +7,7 @@ async def _task():
     future = asyncio.Future()
     future.set_result(None)
     await future
-    return 3 ** 2
+    return 3**2
 
 
 async def _run():
@@ -27,5 +27,5 @@ def main():
     print(json.dumps(res))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

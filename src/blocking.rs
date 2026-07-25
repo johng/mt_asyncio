@@ -8,7 +8,7 @@ use std::{
 use crate::errors::CancelledError;
 use crate::events::{Event, ResultHolder};
 
-#[pyclass(frozen, module = "tonio._tonio")]
+#[pyclass(frozen, module = "mt_asyncio._mt_asyncio")]
 pub(crate) struct BlockingTaskCtl {
     tid: atomic::AtomicUsize,
 }

@@ -14,11 +14,8 @@ mod errors;
 mod events;
 mod handles;
 mod io;
-mod net;
 mod py;
 mod runtime;
-mod scope;
-mod sync;
 mod time;
 mod work;
 
@@ -27,9 +24,17 @@ static RUNTIME: pyo3::sync::PyOnceLock<Py<runtime::Runtime>> = pyo3::sync::PyOnc
 fn get_lib_version() -> &'static str {
     static LIB_VERSION: OnceLock<String> = OnceLock::new();
 
+    // Cargo wants semver, PyPI wants PEP 440: `0.1.0-alpha.1` ships as `0.1.0a1`.
+    // Keep `__version__` matching the distribution version maturin derives.
     LIB_VERSION.get_or_init(|| {
         let version = env!("CARGO_PKG_VERSION");
-        version.replace("-alpha", "a").replace("-beta", "b")
+        version
+            .replace("-alpha.", "a")
+            .replace("-alpha", "a")
+            .replace("-beta.", "b")
+            .replace("-beta", "b")
+            .replace("-rc.", "rc")
+            .replace("-rc", "rc")
     })
 }
 
@@ -64,8 +69,14 @@ fn set_runtime(py: Python<'_>, runtime: Py<runtime::Runtime>) -> PyResult<()> {
 }
 
 #[pymodule(gil_used = false)]
-fn _tonio(module: &Bound<PyModule>) -> PyResult<()> {
+fn _mt_asyncio(module: &Bound<PyModule>) -> PyResult<()> {
     module.add("__version__", get_lib_version())?;
+    //: benchmarks must never compare a `maturin develop` (debug) build against a
+    //  release one -- the gap is several-fold and looks exactly like a regression
+    module.add(
+        "__build_profile__",
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+    )?;
     module.add_function(pyo3::wrap_pyfunction!(get_runtime, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(set_runtime, module)?)?;
 
@@ -73,10 +84,7 @@ fn _tonio(module: &Bound<PyModule>) -> PyResult<()> {
     errors::init_pymodule(module)?;
     events::init_pymodule(module)?;
     io::init_pymodule(module)?;
-    net::init_pymodule(module)?;
     runtime::init_pymodule(module)?;
-    scope::init_pymodule(module)?;
-    sync::init_pymodule(module)?;
 
     Ok(())
 }

@@ -123,13 +123,8 @@ def filter_script_results(results, vidx=0, mode=1):
 def one_million():
     results = []
     impls = [
-        ('TonIO yield', 'tonio_yi', {}),
-        ('TonIO async', 'tonio_aw', {}),
-        ('TonIO yield (context)', 'tonio_yi', {'context': 't'}),
-        ('TonIO async (context)', 'tonio_aw', {'context': 't'}),
+        ('mt_asyncio', 'mt_asyncio_aio', {}),
         ('AsyncIO', 'std', {}),
-        ('Trio', 'trio', {}),
-        ('TinyIO', 'tinyio', {}),
     ]
     for label, impl, extras in impls:
         res = script_benchmark('1m', impl, **extras)
@@ -140,12 +135,8 @@ def one_million():
 def net_sock():
     results = []
     impls = [
-        ('TonIO yield', 'tonio_yi', {}),
-        ('TonIO async', 'tonio_aw', {}),
-        ('TonIO yield (context)', 'tonio_yi', {'context': 't'}),
-        ('TonIO async (context)', 'tonio_aw', {'context': 't'}),
+        ('mt_asyncio', 'mt_asyncio_aio', {}),
         ('AsyncIO', 'std', {}),
-        ('Trio', 'trio', {}),
     ]
     for label, impl, extras in impls:
         with net_server(impl, **extras):
@@ -157,14 +148,10 @@ def net_sock():
 def concurrency():
     results = {'1m': [], 'net_sock': []}
     for label, impl, threads, extras in [
-        ('TonIO yield', 'tonio_yi', 1, {}),
-        ('TonIO async', 'tonio_aw', 1, {}),
-        ('TonIO yield', 'tonio_yi', 2, {'threads': '2'}),
-        ('TonIO async', 'tonio_aw', 2, {'threads': '2'}),
-        ('TonIO yield', 'tonio_yi', 4, {'threads': '4'}),
-        ('TonIO async', 'tonio_aw', 4, {'threads': '4'}),
-        ('TonIO yield', 'tonio_yi', 8, {'threads': '8'}),
-        ('TonIO async', 'tonio_aw', 8, {'threads': '8'}),
+        ('mt_asyncio', 'mt_asyncio_aio', 1, {}),
+        ('mt_asyncio', 'mt_asyncio_aio', 2, {'threads': '2'}),
+        ('mt_asyncio', 'mt_asyncio_aio', 4, {'threads': '4'}),
+        ('mt_asyncio', 'mt_asyncio_aio', 8, {'threads': '8'}),
     ]:
         res = script_benchmark('1m', impl, **extras)
         results['1m'].append((label, threads, filter_script_results(res, 2, -1)))
@@ -176,10 +163,10 @@ def concurrency():
     return results
 
 
-def _tonio_version():
-    import tonio
+def _mt_asyncio_version():
+    import mt_asyncio
 
-    return tonio.__version__
+    return mt_asyncio.__version__
 
 
 def run():
@@ -211,7 +198,7 @@ def run():
                     'run_at': int(now.timestamp()),
                     'pyver': f'{pyver.major}.{pyver.minor}',
                     'results': results,
-                    'tonio': _tonio_version(),
+                    'mt_asyncio': _mt_asyncio_version(),
                 }
             )
         )

@@ -1,1154 +1,337 @@
-# TonIO
+# mt_asyncio
 
-TonIO is a multi-threaded async runtime for free-threaded Python, built in Rust on top of the [mio crate](https://github.com/tokio-rs/mio), and inspired by [tinyio](https://github.com/patrick-kidger/tinyio), [trio](https://github.com/python-trio/trio) and [tokio](https://github.com/tokio-rs/tokio).
-
-> **Warning**: TonIO is currently a work in progress and in alpha state. The APIs are subtle to breaking changes.
-
-> **Note:** TonIO is available on free-threaded Python and Unix systems only.
-
-TonIO supports both using `yield` and the more canonical `async/await` notations, with the latter being available as part of the `tonio.colored` module. Following code snippets show both the usages.
-
-> **Warning:** despite the fact TonIO supports `async` and `await` notations, it's not compatible with any `asyncio` object like futures and tasks. The [TonIO-Monkey](https://github.com/gi0baro/tonio-monkey) project provides patches for some popular `asyncio` packages.
-
-## In a nutshell
-
-<table><tr><td>
-
-`yield` syntax
+mt_asyncio is a **parallel asyncio runtime for free-threaded Python**: one event loop
+that steps asyncio tasks across many OS threads, written in Rust on top of the
+[mio crate](https://github.com/tokio-rs/mio).
 
 ```python
-import tonio
+import mt_asyncio.asyncio as asyncio
 
-def wait_and_add(x: int) -> int:
-    yield tonio.sleep(1)
-    return x + 1
+async def handle(n):
+    await asyncio.sleep(0.1)
+    return n * 2
 
-def foo():
-    four, five = yield tonio.spawn(
-        wait_and_add(3), 
-        wait_and_add(4)
-    )
-    return four, five
+async def main():
+    return await asyncio.gather(*[handle(i) for i in range(1000)])
 
-out = tonio.run(foo())
-assert out == (4, 5)
+asyncio.run(main())
 ```
-</td><td>
 
-`await` syntax
+That is the whole idea: `import mt_asyncio.asyncio as asyncio` and your existing
+coroutines run on more than one core.
 
-```python
-import tonio.colored as tonio
+> **Experiment:** this is an experiment in whether asyncio can be made genuinely
+> parallel on free-threaded Python — not production software. Releases are alpha
+> and the APIs are subject to breaking changes.
 
-async def wait_and_add(x: int) -> int:
-    await tonio.sleep(1)
-    return x + 1
+> **Attribution:** mt_asyncio is derived from [TonIO](https://github.com/gi0baro/tonio)
+> by Giovanni Barillari and keeps its Rust runtime core; TonIO's own `yield`- and
+> `async`-flavoured APIs are not exposed here. mt_asyncio is not affiliated with or
+> endorsed by the TonIO project. See [NOTICE](NOTICE).
 
-async def foo():
-    four, five = await tonio.spawn(
-        wait_and_add(3), 
-        wait_and_add(4)
-    )
-    return four, five
+> **Note:** free-threaded Python (3.14t+) and Unix systems only.
 
-out = tonio.run(foo())
-assert out == (4, 5)
+## Why
+
+CPython's asyncio loop is single-threaded by design: one thread steps every
+task, so an async workload cannot use more than one core no matter how many
+tasks it has. On free-threaded Python that limit is no longer necessary.
+
+mt_asyncio keeps asyncio's API and semantics but replaces the scheduler: tasks are
+handed to a Rust work-stealing runtime and stepped **in parallel** on its worker
+threads. I/O readiness comes from an edge-triggered `mio` reactor, and
+`run_in_executor` from a native blocking thread-pool.
+
+The trade-off is stated up front, because it is the one thing that changes:
+**callbacks are no longer serialized**. Stdlib asyncio gives you implicit mutual
+exclusion (everything runs on the loop thread); mt_asyncio does not. Shared state
+touched from tasks or callbacks needs a lock — the ones in `mt_asyncio.asyncio` are
+genuinely cross-thread. This is the price of using multiple cores.
+
+## Install
+
 ```
-</td></tr></table>
+pip install --pre mt-asyncio
+```
+
+Releases are alpha for now, so `--pre` is required until the first stable one.
+
+Requires a free-threaded CPython build (`python3.14t` or `python3.15t`).
 
 ## Usage
 
-### Entrypoint
-
-Every TonIO program consist of an entrypoint, which should be passed to the `run` method:
-
-<table><tr><td>
-
-`yield` syntax
+Everything lives in `mt_asyncio.asyncio`, which mirrors the `asyncio` namespace:
 
 ```python
-import tonio
+import mt_asyncio.asyncio as asyncio
 
-def main():
-    yield
-    print("Hello world")
-
-tonio.run(main())
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
+async def worker(queue):
+    while True:
+        item = await queue.get()
+        if item is None:
+            return
+        await process(item)
 
 async def main():
-    await tonio.yield_now()
-    print("Hellow world")
+    queue = asyncio.Queue(maxsize=100)
 
-tonio.run(main())
+    async with asyncio.TaskGroup() as tg:
+        for _ in range(8):
+            tg.create_task(worker(queue))
+
+        async for item in source():
+            await queue.put(item)
+        for _ in range(8):
+            await queue.put(None)
+
+asyncio.run(main())
 ```
-</td></tr></table>
 
-TonIO also provides a `main` decorator, thus we can rewrite the previous example as:
+Supported: `run`, `create_task`, `gather`, `wait`, `wait_for`, `shield`,
+`as_completed`, `sleep`, `to_thread`, `TaskGroup`, `timeout`/`timeout_at`,
+`Future`, `Task` (with `cancel`/`cancelling`/`uncancel`), `Lock`, `Event`,
+`Condition`, `Semaphore`, `BoundedSemaphore`, `Queue`/`LifoQueue`/`PriorityQueue`,
+`run_coroutine_threadsafe`, `wrap_future`, and the loop's `call_soon`,
+`call_later`, `call_at`, `run_in_executor`, `getaddrinfo`, and `sock_*` methods.
 
-<table><tr><td>
+Networking: `add_reader`/`add_writer`, `create_connection`, `create_server`,
+`start_tls`, `open_connection`/`start_server` and TLS.
 
-`yield` syntax
+Not implemented: datagram endpoints, subprocesses, `Barrier`, and loop
+policies. See [`mt_asyncio/asyncio/COMPATIBILITY.md`](mt_asyncio/asyncio/COMPATIBILITY.md)
+for the full surface, the behavioural differences, and the workarounds.
+
+### Third-party libraries
+
+There are two ways to reach a database here, and which one fits depends on the
+shape of your concurrency rather than on what is supported.
+
+**Async driver.** psycopg's async API works under `compat.install()` — it waits
+on `add_reader`/`add_writer`, which are implemented. Its `wait_async` loop is
+covered in `tests/test_netlibs.py` against both backends, and concurrent queries
+across many connections are verified against a real server.
 
 ```python
-import tonio
+import mt_asyncio.asyncio as asyncio
 
-@tonio.main
-def main():
-    yield
-    print("Hello world")
+asyncio.compat.install()   # before importing psycopg
 
-main()
-```
-</td><td>
+import psycopg
 
-`await` syntax
+async def fetch_user(conn, user_id):
+    async with conn.cursor() as cur:
+        await cur.execute('select name from users where id = %s', (user_id,))
+        return await cur.fetchone()
 
-```python
-import tonio.colored as tonio
-
-@tonio.main
 async def main():
-    await tonio.yield_now()
-    print("Hello world")
+    async with await psycopg.AsyncConnection.connect('postgresql:///app') as conn:
+        return await fetch_user(conn, 1)
 
-main()
+asyncio.run(main())
 ```
-</td></tr></table>
 
-> **Note:** as you can see the `colored` module provides the additional `yield_now` coroutine, a quick way to define a suspension point, given you cannot just `yield` as in the non-colored notation.
+No thread per query, so concurrency is bounded only by your connection pool. The
+cost is a reactor hop per round trip.
 
-> **Note:** both `run` and `main` can only be called once per program. To run the runtime multiple times in the same program, follow the section below.
-
-#### Manually managing the runtime
-
-TonIO also provides the `runtime` function, to manually manage the runtime lifecycle:
+**Sync driver behind `to_thread`.** One pool thread per in-flight query, capped
+by `blocking_threadpool_size` (128 by default), and no event-loop work in the
+query path at all. This is also the only option for clients with no async API —
+`requests`, `boto3`, and plenty of vendor SDKs.
 
 ```python
-import tonio
+import mt_asyncio.asyncio as asyncio
+from psycopg_pool import ConnectionPool
 
-def _run1():
-    ...
+pool = ConnectionPool('postgresql:///app', min_size=16, max_size=16)
 
-async def _run2():
-    ...
+async def fetch_user(user_id):
+    def query():
+        with pool.connection() as conn:
+            return conn.execute('select name from users where id = %s', (user_id,)).fetchone()
 
-def main():
-    runtime = tonio.runtime()
-    runtime.run_until_complete(_run1())
-    runtime.run_until_complete(_run2())
+    return await asyncio.to_thread(query)
+
+async def main():
+    return await asyncio.gather(*[fetch_user(i) for i in range(1000)])
+
+asyncio.run(main())
 ```
 
-#### Runtime options
+`to_thread` hands `query` to the runtime's native blocking pool. Note this is a
+better `to_thread` than the stdlib one rather than a fallback from it: on a
+free-threaded build those threads run Python *concurrently*, so the queries are
+genuinely in flight at once instead of taking turns under the GIL — and the
+coroutines awaiting them are stepped in parallel too. Size the connection pool,
+or bound it with a `Semaphore`, so you do not queue more work than the database
+can take.
 
-The `run`, `main` and `runtime` methods accept options, specifically:
+The `db_query` benchmark measures the `to_thread` pattern; point
+`MT_ASYNCIO_BENCH_DSN` at a real server to run it against Postgres.
 
-| option name | description | default |
+### Blocking calls
+
+Blocking directly in a coroutine is survivable here, which it is not under
+stdlib: it occupies **one worker**, and the others keep stepping tasks.
+
+```python
+async def handler():
+    time.sleep(0.05)      # occupies a worker for 50ms, not the whole loop
+    return 'done'
+```
+
+There are two ways to make that safe, and on a free-threaded build both are
+legitimate — the choice is about failure modes, not speed.
+
+**Offload it.** `await asyncio.to_thread(...)` moves the call to the blocking
+pool and keeps every worker free.
+
+**Or just have more workers.** Blocked threads are off-CPU, so raising `threads`
+costs little. Measured with 64 concurrent 10ms blocking calls:
+
+| | 8 workers | 128 workers |
 | --- | --- | --- |
-| `context` | enable `contextvars` usage in coroutines | `False` |
-| `signals` | list of signals to listen to | |
-| `threads` | Number of runtime threads | # of CPU cores |
-| `blocking_threadpool_size` | Maximum number of blocking threads | 128 |
-| `blocking_threadpool_idle_ttl` | Idle timeout for blocking threads (in seconds) | 30 |
+| blocking inline | 102.6 ms | **16.7 ms** |
+| via `to_thread` | 14.9 ms | 18.5 ms |
+| CPU-bound workload | 724.8 ms | **362.4 ms** |
 
-### Events
+At 128 workers, inline blocking matches `to_thread`, and CPU work did not suffer
+from oversubscription on an 18-core machine.
 
-The core object in TonIO is `Event`. It's basically a wrapper around an atomic boolean flag, initialised with `False`. `Event` provides the following methods:
+What the split still buys is **isolation and elasticity**, not throughput:
 
-- `is_set()`: return the value of the flag
-- `set()`: set the flag to `True`
-- `clear()`: set the flag to `False`
-- `wait(timeout=None)`: returns a coroutine you can yield on that unblocks when the flag is set to `True` or the timeout expires. Timeout is in seconds.
+- Exhaust the blocking pool and offloads simply queue — the scheduler keeps
+  running. Exhaust the workers and the runtime stalls, because workers are also
+  what run task steps, timers and I/O dispatch. Raising `threads` moves that
+  cliff without removing it.
+- Pool threads are created on demand and retire after
+  `blocking_threadpool_idle_ttl`; workers are created at startup and live for the
+  life of the process.
 
-<table><tr><td>
+The cost of the split is that the two pools cannot help each other: a blocking
+pool thread never steps a coroutine, and a worker never picks up offloaded work.
 
-`yield` syntax
+The cliff is worth seeing, because it is silent. With 4 workers, a 50ms blocking
+call, and an unrelated task watching how long it is kept off the CPU:
 
-```python
-import tonio
+| concurrent blockers | throughput | worst stall elsewhere |
+| --- | --- | --- |
+| 3 (`threads - 1`) | unaffected | 1 ms |
+| 4 (`threads`) | *still* unaffected | **51 ms** |
 
-@tonio.main
-def main():
-    event = tonio.Event()
+At exactly the worker count the wall clock looks fine while everything else
+freezes for the full duration. The default `threads` is `cpu_count() + 4` for
+this reason — headroom so ordinary blocking does not reach the edge. Use
+`to_thread` when you want that guarantee rather than a margin, and raise
+`threads` when your workload is mostly blocking and you would rather not
+partition your threads at all.
 
-    def setter():
-        yield tonio.sleep(1)
-        event.set()
+### Sizing the runtime
 
-    tonio.spawn(setter())
-    yield event.wait()
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-
-@tonio.main
-async def main():
-    event = tonio.Event()
-
-    async def setter():
-        await tonio.sleep(1)
-        event.set()
-
-    tonio.spawn(setter())
-    await event.wait()
-```
-</td></tr></table>
-
-### Spawning tasks
-
-TonIO provides the `spawn` method to schedule new coroutines onto the runtime:
-
-<table><tr><td>
-
-`yield` syntax
+`run()` takes a `threads` argument, and `mt_asyncio.runtime()` configures the
+process-wide runtime up front:
 
 ```python
-import tonio
+import mt_asyncio
+import mt_asyncio.asyncio as asyncio
 
-def doubv(v):
-    yield
-    return v * 2
+# 8 worker threads, a smaller blocking pool
+mt_asyncio.runtime(threads=8, blocking_threadpool_size=32, context=True)
 
-@tonio.main
-def main():
-    parallel = tonio.spawn(doubv(2), doubv(3))
-    v3 = yield doubv(4)
-    v1, v2 = yield parallel
-    print([v1, v2, v3])
+asyncio.run(main())
 ```
-</td><td>
 
-`await` syntax
+| option | description | default |
+| --- | --- | --- |
+| `threads` | runtime worker threads (scheduler *and* execution) | # of CPU cores + 4 |
+| `context` | propagate `contextvars` into coroutines (required by the loop) | `False` |
+| `blocking_threadpool_size` | maximum blocking threads | 128 |
+| `blocking_threadpool_idle_ttl` | idle timeout for blocking threads (seconds) | 30 |
+| `signals` | signals the runtime listens for | |
+
+### The drop-in boundary
+
+`import mt_asyncio.asyncio as asyncio` parallelizes code that uses **those** names.
+A third-party library does `import asyncio` internally and gets CPython's.
+
+The C `Future`/`Task` are not the obstacle — on 3.14t the current-task slot lives
+in thread state and `Future` is internally locked. The problem is the
+*pure-Python* layer above them, which has no synchronisation at all:
+`gather._done_callback` does an unsynchronised `nfinished += 1`, so one lost
+increment means the outer future never resolves, and `Lock.acquire` check-then-sets
+`_locked` over a bare deque. Those failures are **hangs**, not wrong answers.
+
+Compat mode points those names at mt_asyncio's own locked implementations:
 
 ```python
-import tonio.colored as tonio
+import mt_asyncio.asyncio as asyncio
 
-async def doubv(v):
-    await tonio.yield_now()
-    return v * 2
+asyncio.compat.install()   # before importing libraries that should see it
 
-@tonio.main
-async def main():
-    parallel = tonio.spawn(doubv(2), doubv(3))
-    v3 = await doubv(4)
-    v1, v2 = await parallel
-    print([v1, v2, v3])
-```
-</td></tr></table>
-
-Coroutines passed to `spawn` get schedule onto the runtime immediately. Using `yield` or `await` on the return value of `spawn` just waits for the coroutines to complete and retreive the results.
-
-#### Blocking tasks
-
-TonIO provides the `spawn_blocking` method to schedule blocking operations onto the runtime:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-
-def read_file(path):
-    with open(file, "r") as f:
-        return f.read()
-
-@tonio.main
-def main():
-    file_data = yield tonio.spawn_blocking(
-        read_file, 
-        "sometext.txt"
-    )
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-
-def read_file(path):
-    with open(file, "r") as f:
-        return f.read()
-
-@tonio.main
-async def main():
-    file_data = await tonio.spawn_blocking(
-        read_file, 
-        "sometext.txt"
-    )
-```
-</td></tr></table>
-
-#### Running tasks from synchronous contexts
-
-TonIO provides the `block_on` method to spawn coroutines from a synchronous context. It works the same way of `spawn`, except it accepts a single coroutine and it blocks the current thread until the coroutine is completed.
-
-> **Warning:** using `block_on` from within a coroutine might produce a runtime deadlock.
-
-#### Map utilities
-
-TonIO provides the `map` and `map_blocking` utilities to spawn the same operation with an iterable of parameters:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-
-accum = []
-
-def task(no):
-    yield tonio.sleep(0.5)
-    accum.append(no * 2)
-
-@tonio.main
-def main():
-    yield tonio.map(task, range(4))
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-
-accum = []
-
-async def task(no):
-    await tonio.sleep(0.5)
-    accum.append(no * 2)
-
-@tonio.main
-async def main():
-    await tonio.map(task, range(4))
-```
-</td></tr></table>
-
-#### Completion-based iterators
-
-TonIO provides the `as_completed` utility to iterate over task results based on completion order:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-
-def _sleep(v):
-    yield tonio.sleep(v)
-    return v
-
-@tonio.main
-def main():
-    vals = []
-    for task in tonio.as_completed(
-        _sleep(0.5),
-        _sleep(0.1),
-        _sleep(0.3),
-    ):
-        vals.append(yield task)
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-
-async def _sleep(v):
-    await tonio.sleep(v)
-    return v
-
-@tonio.main
-async def main():
-    vals = []
-    async for val in tonio.as_completed(
-        _sleep(0.5),
-        _sleep(0.1),
-        _sleep(0.3),
-    ):
-        vals.append(val)
-```
-</td></tr></table>
-
-### Scopes and cancellations
-
-TonIO provides a `scope` context, that lets you cancel work spawned within it:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-
-def slow_push(target, sleep):
-    yield tonio.sleep(sleep)
-    target.append(True)
-
-@tonio.main
-def main():
-    values = []
-    with tonio.scope() as scope:
-        scope.spawn(_slow_push(values, 0.1))
-        scope.spawn(_slow_push(values, 2))
-        yield tonio.sleep(0.2)
-        scope.cancel()
-    yield scope()
-    assert len(values) == 1
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-
-async def slow_push(target, sleep):
-    await tonio.sleep(sleep)
-    target.append(True)
-
-@tonio.main
-async def main():
-    values = []
-    async with tonio.scope() as scope:
-        scope.spawn(_slow_push(values, 0.1))
-        scope.spawn(_slow_push(values, 2))
-        await tonio.sleep(0.2)
-        scope.cancel()
-    assert len(values) == 1
-```
-</td></tr></table>
-
-When you `yield` on the scope, it will wait for all the spawned coroutines to end. If the scope was canceled, then all the pending coroutines will be canceled.
-
-> **Note:** as you can see, the *colored* version of `scope` doesn't require to be `await`ed, as it will *yield* when exiting the context.
-
-#### Select first completing task
-
-TonIO also provides a `select` utility to cancel remaining work on the first completing task:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-
-def slow_push(target, sleep):
-    yield tonio.sleep(sleep)
-    target.append(True)
-
-@tonio.main
-def main():
-    values = []
-    yield tonio.select(
-        _slow_push(values, 0.1),
-        _slow_push(values, 2)
-    )
-    assert len(values) == 1
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-
-async def slow_push(target, sleep):
-    await tonio.sleep(sleep)
-    target.append(True)
-
-@tonio.main
-async def main():
-    values = []
-    await tonio.select(
-        _slow_push(values, 0.1),
-        _slow_push(values, 2)
-    )
-    assert len(values) == 1
-```
-</td></tr></table>
-
-### Time-related functions
-
-- `tonio.time.time()`: a function returning the runtime's clock (in seconds, microsecond resolution)
-- `tonio.time.sleep(delay)`: a coroutine you can yield on to sleep (delay is in seconds)
-- `tonio.time.timeout(coro, timeout)`: a coroutine you can yield on returning a tuple `(output, success)`. If the coroutine succeeds in the given time then the pair `(output, True)` is returned. Otherwise this will return `(None, False)`.
-
-> **Note**: `time.sleep` is also exported to the main `tonio` module.
-
-> **Note**: all of the above functions are also present in `tonio.colored.time` module.
-
-#### Scheduling work
-
-TonIO provides the `time.interval` function to create interval objects you can yield on a scheduled basis:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-from tonio import time
-
-def some_task():
-    ...
-
-def scheduler():
-    interval = time.interval(1)
-    while True:
-        yield interval.tick()
-        tonio.spawn(some_task())
-
-@tonio.main
-def main():
-    tonio.spawn(scheduler())
-    # do some other work
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-from tonio.colored import time
-
-async def some_task():
-    ...
-
-async def scheduler():
-    interval = time.interval(1)
-    while True:
-        await interval.tick()
-        tonio.spawn(some_task())
-
-@tonio.main
-async def main():
-    tonio.spawn(scheduler())
-    # do some other work
-```
-</td></tr></table>
-
-The `interval` method first argument is the interval in seconds resolution, and the method also accepts an optional `at` argument, to delay the first execution at a specific time (from the runtime's clock perspective):
-
-```python
-from tonio import time
-
-# tick every 500ms, with the first tick happening in 5 seconds from now
-interval = time.interval(0.5, time.time() + 5)
+import some_library
+asyncio.run(some_library.main())
 ```
 
-### Synchronization primitives
+`gather`, `wait_for`, `TaskGroup`, `Lock`, `Event`, `Queue`, `Future`,
+`create_task` and the rest are redirected, in `asyncio` and in the submodules that
+re-export them. Install **before** importing anything that should see it —
+shadowing only rebinds module attributes, so a module that already did
+`from asyncio import Lock` keeps the original. Patching is process-global;
+`compat.uninstall()` reverses it.
 
-Synchronization primitives are exposed in the `tonio.sync` module.
+Transports are implemented — `add_reader`/`add_writer`, `create_connection`,
+`create_server`, `start_tls` and streams all work, over TLS as well as plain TCP.
+psycopg's async API, aiohttp and websockets all drive them correctly.
 
-#### Lock
+The remaining boundary is one level up, and no lock can close it: a library that
+shares mutable state **between tasks** can race, because tasks step in parallel.
+Both aiohttp and websockets keep a registry of live connections and iterate it
+during server shutdown while another task mutates it, so their shutdown paths are
+unreliable here even though serving traffic is not. `anyio` (and therefore
+`httpx`) livelocks against our cooperative cancellation and is unsupported. See
+[`COMPATIBILITY.md`](mt_asyncio/asyncio/COMPATIBILITY.md) for the measurements.
 
-Implements a classic mutex, or a non-reentrant, single-owner lock for coroutines:
+## Compatibility testing
 
-<table><tr><td>
+`tests/test_parity.py` is a differential suite: every scenario is written once
+and run against **both** stdlib `asyncio` and `mt_asyncio.asyncio`, asserting the same
+observable outcome. A divergence that is not listed in `COMPATIBILITY.md` is
+treated as a bug.
 
-`yield` syntax
-
-```python
-import tonio
-from tonio import sync
-
-@tonio.main
-def main():
-    # counter can't go above 1
-    counter = 0
-
-    def _count(lock):
-        nonlocal counter
-        with (yield lock()):
-            counter += 1
-            yield
-            counter -= 1
-    
-    lock = sync.Lock()
-    yield tonio.spawn(*[
-        _count(lock)
-        for _ in range(10)
-    ])
 ```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-from tonio.colored import sync
-
-@tonio.main
-async def main():
-    # counter can't go above 1
-    counter = 0
-
-    async def _count(lock):
-        nonlocal counter
-        async with lock:
-            counter += 1
-            await tonio.yield_now()
-            counter -= 1
-    
-    lock = sync.Lock()
-    await tonio.spawn(*[
-        _count(lock)
-        for _ in range(10)
-    ])
-```
-</td></tr></table>
-
-The `Lock` object also implements an `or_raise` method, that will immediately fail when the lock cannot be acquired:
-
-```python
-from tonio.exceptions import WouldBlock
-
-try:
-    with lock.or_raise():
-        ...
-except WouldBlock:
-    ...
+make test
 ```
 
-#### Semaphore
-
-A semaphore for coroutines:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-from tonio import sync
-
-@tonio.main
-def main():
-    # counter can't go above 2
-    counter = 0
-
-    def _count(semaphore):
-        nonlocal counter
-        with (yield semaphore()):
-            counter += 1
-            yield
-            counter -= 1
-    
-    semaphore = sync.Semaphore(2)
-    yield tonio.spawn(*[
-        _count(semaphore)
-        for _ in range(10)
-    ])
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-from tonio.colored import sync
-
-@tonio.main
-async def main():
-    # counter can't go above 2
-    counter = 0
-
-    async def _count(semaphore):
-        nonlocal counter
-        async with semaphore:
-            counter += 1
-            await tonio.yield_now()
-            counter -= 1
-    
-    semaphore = sync.Semaphore(2)
-    await tonio.spawn(*[
-        _count(semaphore)
-        for _ in range(10)
-    ])
-```
-</td></tr></table>
-
-As for locks, the `Semaphore` object also implements an `or_raise` method, that will immediately fail when the lock cannot be acquired:
-
-```python
-from tonio.exceptions import WouldBlock
-
-try:
-    with semaphore.or_raise():
-        ...
-except WouldBlock:
-    ...
-```
-
-The `Semaphore` object also implements a `tokens` method, that returns the number of available tokens.
-
-#### Barrier
-
-A barrier for coroutines:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-from tonio import sync
-
-@tonio.main
-def main():
-    barrier = sync.Barrier(3)
-    count = 0
-
-    def _start_at_3():
-        nonlocal count
-        count += 1
-        i = yield barrier.wait()
-        assert count == 3
-        return i
-
-    yield tonio.spawn(*[
-        _start_at_3()
-        for _ in range(3)
-    ])
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-from tonio.colored import sync
-
-@tonio.main
-async def main():
-    barrier = sync.Barrier(3)
-    count = 0
-
-    async def _start_at_3():
-        nonlocal count
-        count += 1
-        i = await barrier.wait()
-        assert count == 3
-        return i
-
-    await tonio.spawn(*[
-        _start_at_3()
-        for _ in range(3)
-    ])
-```
-</td></tr></table>
-
-The `Barrier` object also implements a `value` method, which returns the current value of the barrier.
-
-#### Channels
-
-Multi-producer multi-consumer channels for inter-coroutine communication.
-
-The `tonio.sync.channel` module provides both a `channel` and an `unbounded` constructors.    
-The main difference between *bounded* and *unbounded* channels, as the names suggest, is that while the first will suspend sending messages once the specified length is reached, and it will resume accepting messages once the existing buffer is consumed, the latter will always accept new messages. That's also why, the sender part of a bounded channel is async, while in the unbounded is not.
-
-##### Bounded channel
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-from tonio import sync
-from tonio.sync import channel
-
-def producer(sender, barrier, offset):
-    for i in range(20):
-        message = offset + 1
-        yield sender.send(message)
-    yield barrier.wait()
-
-def consumer(receiver):
-    while True:
-        try:
-            message = yield receiver.receive()
-            print(message)
-        except Exception:
-            break
-
-@tonio.main
-def main():
-    def close(sender, barrier):
-        yield barrier.wait()
-        sender.close()
-
-    sender, receiver = channel.channel(2)
-    barrier = sync.Barrier(3)
-    yield tonio.spawn(*[
-        producer(sender, barrier, 100),
-        producer(sender, barrier, 200),
-        consumer(receiver),
-        consumer(receiver),
-        consumer(receiver),
-        consumer(receiver),
-        close(sender, barrier),
-    ])
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-from tonio.colored import sync
-from tonio.colored.sync import channel
-
-async def producer(sender, barrier, offset):
-    for i in range(20):
-        message = offset + 1
-        await sender.send(message)
-    await barrier.wait()
-
-async def consumer(receiver):
-    while True:
-        try:
-            message = await receiver.receive()
-            print(message)
-        except Exception:
-            break
-
-@tonio.main
-async def main():
-    async def close(sender, barrier):
-        await barrier.wait()
-        sender.close()
-
-    sender, receiver = channel.channel(2)
-    barrier = sync.Barrier(3)
-    await tonio.spawn(*[
-        producer(sender, barrier, 100),
-        producer(sender, barrier, 200),
-        consumer(receiver),
-        consumer(receiver),
-        consumer(receiver),
-        consumer(receiver),
-        close(sender, barrier),
-    ])
-```
-</td></tr></table>
-
-##### Unbounded channel
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-from tonio import sync
-from tonio.sync import channel
-
-def producer(sender, barrier, offset):
-    for i in range(20):
-        message = offset + 1
-        sender.send(message)
-    yield barrier.wait()
-
-def consumer(receiver):
-    while True:
-        try:
-            message = yield receiver.receive()
-            print(message)
-        except Exception:
-            break
-
-@tonio.main
-def main():
-    def close(sender, barrier):
-        yield barrier.wait()
-        sender.close()
-
-    sender, receiver = channel.unbounded()
-    barrier = sync.Barrier(3)
-    yield tonio.spawn(*[
-        producer(sender, barrier, 100),
-        producer(sender, barrier, 200),
-        consumer(receiver),
-        consumer(receiver),
-        consumer(receiver),
-        consumer(receiver),
-        close(sender, barrier),
-    ])
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-from tonio.colored import sync
-from tonio.colored.sync import channel
-
-async def producer(sender, barrier, offset):
-    for i in range(20):
-        message = offset + 1
-        sender.send(message)
-    await barrier.wait()
-
-async def consumer(receiver):
-    while True:
-        try:
-            message = await receiver.receive()
-            print(message)
-        except Exception:
-            break
-
-@tonio.main
-async def main():
-    async def close(sender, barrier):
-        await barrier.wait()
-        sender.close()
-
-    sender, receiver = channel.unbounded()
-    barrier = sync.Barrier(3)
-    await tonio.spawn(*[
-        producer(sender, barrier, 100),
-        producer(sender, barrier, 200),
-        consumer(receiver),
-        consumer(receiver),
-        consumer(receiver),
-        consumer(receiver),
-        close(sender, barrier),
-    ])
-```
-</td></tr></table>
-
-### Network module
-
-Network primitives are exposed under the `tonio.net` module.
-
-#### Streams
-
-The high-level network primitives in TonIO are centered aroud the `SocketStream` and `SocketListener` objects.
-
-The `SocketListener` object implements an `accept` coroutine which returns a `SocketStream` object.    
-The `SocketStream` object implements the `send_all` and `receive_some` coroutines to send and receive data.    
-Both objects implement a `close` method to shutdown the underlying socket.
-
-You can create and interact with the above objects using some high-level helpers in the `net` module, specifically:
-
-- `open_tcp_stream`: a coroutine to open a `SocketStream` connected to a TCP endpoint
-- `open_unix_socket`: a coroutine to open a `SocketStream` connected to an Unix socket
-- `open_tcp_listeners`: a coroutine to initialise `SocketListener` objects
-- `serve_listeners`: a coroutine to spawn `SocketListener` accept loops targeting a handler
-- `serve_tcp`: a coroutine that join `open_tcp_listener` and `serve_listeners` in one call
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-from tonio.net import open_tcp_stream, serve_tcp
-
-def server():
-    yield serve_tcp(
-        server_handle, 
-        host='127.0.0.1', 
-        port=8000
-    )
-
-def server_handle(stream):
-    # receive some data
-    data = yield stream.receive_some()
-
-def client():
-    stream = yield open_tcp_stream(
-        host='127.0.0.1', 
-        port=8000
-    )
-    # send some data
-    yield stream.send_all("message")
-```
-</td><td>
-
-`await` syntax
-
-```python
-from tonio.colored.net import open_tcp_stream, serve_tcp
-
-async def server():
-    await serve_tcp(
-        server_handle, 
-        host='127.0.0.1', 
-        port=8000
-    )
-
-async def server_handle(stream):
-    # receive some data
-    data = await stream.receive_some()
-
-async def client():
-    stream = await open_tcp_stream(
-        host='127.0.0.1', 
-        port=8000
-    )
-    # send some data
-    await stream.send_all("message")
-```
-</td></tr></table>
-
-#### TLS streams
-
-TonIO implement TLS wrappers around the streaming APIs through primitives in the `tonio.net.tls` module.
-
-TonIO provides the `TLSStream` and `TLSListener` object wrappers and the following high-level helpers:
-
-- `open_tls_over_tcp_stream`: a coroutine to open a `TLSStream` wrapping a TCP `SocketStream`
-- `open_tls_over_tcp_listeners`: a coroutine to initialise `TLSListener` objects
-- `serve_tls_over_tcp`: a coroutine that join `open_tls_over_tcp_listeners` and `serve_listeners` in one call
-
-#### Low-level sockets
-
-The `tonio.net.socket` module provides TonIO's basic low-level networking API.    
-Generally, the API exposed by this module mirrors the standard library `socket` module.
-
-TonIO socket objects are overall very similar to the standard library socket objects, with the main difference being that blocking methods become coroutines.
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import tonio
-from tonio.net import socket
-
-def server():
-    sock = socket.socket()
-    with sock:
-        yield sock.bind(('127.0.0.1', 8000))
-        sock.listen()
-
-        while True:
-            client, _ = yield sock.accept()
-            tonio.spawn(server_handle(client))
-
-def server_handle(connection):
-    with connection:
-        # receive some data
-        data = yield connection.recv(4096)
-
-def client():
-    sock = socket.socket()
-    with sock:
-        yield sock.connect(('127.0.0.1', 8000))
-        yield sock.send("message")
-```
-</td><td>
-
-`await` syntax
-
-```python
-import tonio.colored as tonio
-from tonio.colored.net import socket
-
-async def server():
-    sock = socket.socket()
-    with sock:
-        await sock.bind(('127.0.0.1', 8000))
-        sock.listen()
-
-        while True:
-            client, _ = await sock.accept()
-            tonio.spawn(server_handle(client))
-
-async def server_handle(connection):
-    with connection:
-        # receive some data
-        data = await connection.recv(4096)
-
-async def client():
-    sock = socket.socket()
-    with sock:
-        await sock.connect(('127.0.0.1', 8000))
-        await sock.send("message")
-```
-</td></tr></table>
-
-### Signals
-
-TonIO provides a context manager to catch signals.
-
-The usage of such context manager requires to first configure the runtime to listen for such signals:
-
-<table><tr><td>
-
-`yield` syntax
-
-```python
-import signal
-import tonio
-from tonio.time import interval
-
-def sig_handle():
-    with tonio.signal_receiver(
-        signal.SIGHUP, 
-        signal.SIGUSR1
-    ) as sigs:
-        for ev in sigs:
-            sig = yield ev
-            if sig == signal.SIGHUP:
-                ...
-
-@tonio.main(
-    signals=[signal.SIGHUP, signal.SIGUSR1]
-)
-def main():
-    tonio.spawn(sig_handle())
-    ticker = interval(1)
-    while True:
-        yield ticker.tick()
-```
-</td><td>
-
-`await` syntax
-
-```python
-import signal
-import tonio.colored as tonio
-from tonio.colored.time import interval
-
-async def sig_handle():
-    with tonio.signal_receiver(
-        signal.SIGHUP, 
-        signal.SIGUSR1
-    ) as sigs:
-        async for sig in sigs:
-            if sig == signal.SIGHUP:
-                ...
-
-@tonio.main(
-    signals=[signal.SIGHUP, signal.SIGUSR1]
-)
-async def main():
-    tonio.spawn(sig_handle())
-    ticker = interval(1)
-    while True:
-        await ticker.tick()
-```
-</td></tr></table>
+## Performance
+
+Speedup versus stdlib asyncio on the same coroutines (free-threaded CPython
+3.14.4, Apple M5 Max — 6 performance + 12 efficiency cores; median of 3 runs via
+`bench/asyncio_bench.py`, or `make bench`):
+
+| workload | 1 thread | best |
+| --- | --- | --- |
+| CPU work between awaits | 1.21× | 7.34× @16 |
+| each unit under `wait_for` | 0.97× | 6.59× @16 |
+| fan-out with `TaskGroup` | 1.08× | 5.72× @16 |
+| server handler (I/O + per-request work) | 1.00× | 5.28× @16 |
+| producer → queue → consumers | 1.02× | 3.88× @8 |
+| one shared `Lock` | 0.95× | 3.01× @4 |
+| pure scheduling, no per-task work | 1.41× | 1.60× @16 |
+| many real `sleep()` timers | 0.51× | 0.55× @4 |
+| create + cancel + unwind | 0.62× | 0.62× @1 |
+
+Read that honestly. mt_asyncio is at rough parity per-thread and wins by
+parallelizing, so the more real work a task does between awaits, the better it
+does. Two things are genuinely slower: **timers** — each `sleep()` builds a
+`Future`, a `TimerHandle` and a helper coroutine where the runtime underneath
+needs only one native waiter — and **cancellation**, which is pure coordination
+and gets *worse* with more threads. Past 6 threads this machine is scheduling
+onto efficiency cores, so the 16-thread column is not 16 equal cores.
+
+Benchmarks must be run against a release build (`make build-release`); the
+scripts refuse to run on a debug one, which is several times slower.
 
 ## License
 
-TonIO is released under the BSD License.
+mt_asyncio is released under the BSD-3-Clause License, the same license as TonIO,
+whose copyright notice it retains. Ported CPython code is additionally covered
+by the PSF License Agreement. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

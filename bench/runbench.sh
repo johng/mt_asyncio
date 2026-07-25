@@ -8,8 +8,8 @@ uv venv -p 3.14t ./bench/.venv
 uv sync --group build
 
 uv run maturin build --release --interpreter ./bench/.venv/bin/python
-VIRTUAL_ENV=$(pwd)/bench/.venv uv pip install $(ls target/wheels/tonio-*-cp314-*.whl)
-VIRTUAL_ENV=$(pwd)/bench/.venv uv pip install numpy trio tinyio
+VIRTUAL_ENV=$(pwd)/bench/.venv uv pip install $(ls target/wheels/mt_asyncio-*-cp314-*.whl)
+VIRTUAL_ENV=$(pwd)/bench/.venv uv pip install numpy
 
 cd ./bench
 

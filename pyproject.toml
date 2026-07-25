@@ -1,7 +1,7 @@
 [project]
-name = 'tonio'
+name = 'mt-asyncio'
 authors = [
-    { name = 'Giovanni Barillari', email = 'g@baro.dev' }
+    { name = 'John Griffith', email = 'john.griffith243@gmail.com' }
 ]
 classifiers = [
     'Development Status :: 3 - Alpha',
@@ -40,27 +40,35 @@ test = [
     'pytest~=8.3',
     'trustme~=1.2',
 ]
+# upstream TonIO, installed alongside mt_asyncio so bench/tonio_regression.py can
+# check the shared Rust core has not regressed. Distinct package + extension
+# module names, so the two coexist in one venv.
+bench = [
+    'tonio==0.8.3',
+]
 
 all = [
     { include-group = 'build' },
     { include-group = 'lint' },
     { include-group = 'test' },
+    { include-group = 'bench' },
 ]
 
 [project.urls]
-Homepage = 'https://github.com/gi0baro/tonio'
-Funding = 'https://github.com/sponsors/gi0baro'
-Source = 'https://github.com/gi0baro/tonio'
+Homepage = 'https://github.com/johng/mt_asyncio'
+Source = 'https://github.com/johng/mt_asyncio'
+Issues = 'https://github.com/johng/mt_asyncio/issues'
+Upstream = 'https://github.com/gi0baro/tonio'
 
 [project.entry-points]
-pytest11 = {tonio = "tonio._testutils._pytest_plugin"}
+pytest11 = {mt_asyncio = "mt_asyncio._testutils._pytest_plugin"}
 
 [build-system]
 requires = ['maturin>=1.8.0,<2']
 build-backend = 'maturin'
 
 [tool.maturin]
-module-name = 'tonio._tonio'
+module-name = 'mt_asyncio._mt_asyncio'
 bindings = 'pyo3'
 
 [tool.ruff]
@@ -96,10 +104,10 @@ quote-style = 'single'
 [tool.ruff.isort]
 combine-as-imports = true
 lines-after-imports = 2
-known-first-party = ['tonio', 'tests']
+known-first-party = ['mt_asyncio', 'tests']
 
 [tool.ruff.per-file-ignores]
-'tonio/_tonio.pyi' = ['I001']
+'mt_asyncio/_mt_asyncio.pyi' = ['I001']
 'tests/**' = ['B018', 'S110', 'S501']
 
 [tool.uv]
