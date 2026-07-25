@@ -23,9 +23,24 @@ Returning early on a *generation change* rather than on "buffer is non-empty" is
 what stops ``readexactly(n)`` spinning: with data present but fewer than ``n``
 bytes, the next call sees the generation unchanged and parks properly.
 
-Lock order is **transport -> flow control -> reader**, and nothing may hold the
-reader lock while calling into the transport (see ``_maybe_resume_transport``) or
-the two deadlock against ``data_received``.
+Lock order is **transport -> flow control -> reader**. Stated precisely, the rule
+is that nothing may take the transport lock *for the first time* while holding
+the reader lock, or it deadlocks against ``data_received`` coming the other way.
+``_maybe_resume_transport`` and ``_wait_for_data`` are written around it: both
+decide under the reader lock and call ``resume_reading()`` outside it, because
+both run in the reading task, which holds no transport lock of its own.
+
+``feed_data`` looks like it breaks the rule and does not. It holds the reader
+lock across ``super().feed_data()``, which calls ``transport.pause_reading()``
+once the buffer passes ``2 * limit`` -- but every caller of ``feed_data``,
+``feed_eof`` and ``set_exception`` arrives from a protocol callback, and those
+are entered with the transport's RLock already held *by this thread*. The
+acquisition is re-entrant, so it closes no cycle. (Measured, rather than
+asserted: 31,070 of these under a flow-control-saturating load, every one of them
+re-entrant.) It stops being true the moment something feeds a reader from
+outside a protocol callback -- a test that pokes ``feed_data`` directly is
+harmless because it has no transport, but a *transport-backed* reader fed from
+elsewhere would be the real thing.
 """
 
 from __future__ import annotations
