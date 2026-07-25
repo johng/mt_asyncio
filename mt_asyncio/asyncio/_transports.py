@@ -31,6 +31,7 @@ which is exactly asyncio's contract; the parallelism comes from having many.
 
 from __future__ import annotations
 
+import inspect
 import threading
 from asyncio.selector_events import _SelectorSocketTransport, _SelectorTransport
 
@@ -43,6 +44,14 @@ except ImportError:  # pragma: no cover
 from asyncio.base_events import _set_nodelay
 
 
+# CPython 3.15 gives transports a `context`: the contextvars.Context the
+# connection was opened in, remembered so that every reactor callback the
+# transport schedules runs inside it. 3.14 has no such parameter and no such
+# plumbing, and we support both, so the pass-through is conditional. Detected
+# rather than version-gated -- the constructor is what we actually call.
+_HAS_TRANSPORT_CONTEXT = 'context' in inspect.signature(_SelectorTransport.__init__).parameters
+
+
 class SocketTransport(_SelectorSocketTransport):
     """``_SelectorSocketTransport`` with a per-connection lock.
 
@@ -51,7 +60,7 @@ class SocketTransport(_SelectorSocketTransport):
     have to differ. Those are marked.
     """
 
-    def __init__(self, loop, sock, protocol, waiter=None, extra=None, server=None, lock=None):
+    def __init__(self, loop, sock, protocol, waiter=None, extra=None, server=None, lock=None, context=None):
         # a TLS connection passes the lock in, so the raw transport, SSLProtocol
         # and the app-facing transport are all serialised by the same one
         self._lock = lock if lock is not None else threading.RLock()
@@ -63,13 +72,22 @@ class SocketTransport(_SelectorSocketTransport):
         # connection_made returned. We run the grandparent and sequence the
         # startup ourselves in `_startup`.
         self._read_ready_cb = None
-        _SelectorTransport.__init__(self, loop, sock, protocol, extra, server)
+        if _HAS_TRANSPORT_CONTEXT:
+            # sets self._context, which the inherited _add_reader/_add_writer/
+            # _call_soon helpers then thread through to the loop
+            _SelectorTransport.__init__(self, loop, sock, protocol, extra, server, context)
+        else:
+            _SelectorTransport.__init__(self, loop, sock, protocol, extra, server)
         self._eof = False
         self._empty_waiter = None
         self._write_impl = self._write_sendmsg if _HAS_SENDMSG else self._write_send
         self._write_ready = self._locked_write_ready
         _set_nodelay(self._sock)
-        loop.call_soon(self._startup, waiter)
+        # the 3.15 equivalent of the three call_soons is self._call_soon, which
+        # is exactly this with the context attached; passing it explicitly keeps
+        # one code path across both versions (3.14 ignores it and copies the
+        # current context, as it did before)
+        loop.call_soon(self._startup, waiter, context=context)
 
     # -- startup ------------------------------------------------------------
 

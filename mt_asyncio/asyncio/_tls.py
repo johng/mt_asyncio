@@ -131,6 +131,7 @@ def make_ssl_transport(
     server=None,
     ssl_handshake_timeout=None,
     ssl_shutdown_timeout=None,
+    context=None,
 ):
     lock = threading.RLock()
     ssl_protocol = SSLProtocol(
@@ -145,8 +146,10 @@ def make_ssl_transport(
         lock=lock,
     )
     # the raw transport shares the lock, so every callback it makes into
-    # SSLProtocol is already serialised against the app-facing side
-    SocketTransport(loop, rawsock, ssl_protocol, None, extra, server, lock=lock)
+    # SSLProtocol is already serialised against the app-facing side. `context`
+    # is 3.15's: the raw transport is the one that talks to the reactor, so it
+    # is the one that carries it (upstream does the same).
+    SocketTransport(loop, rawsock, ssl_protocol, None, extra, server, lock=lock, context=context)
     return ssl_protocol._app_transport
 
 
