@@ -20,9 +20,16 @@ asyncio.run(main())
 That is the whole idea: `import mt_asyncio.asyncio as asyncio` and your existing
 coroutines run on more than one core.
 
-> **Experiment:** this is an experiment in whether asyncio can be made genuinely
-> parallel on free-threaded Python — not production software. Releases are alpha
-> and the APIs are subject to breaking changes.
+> **Experimental — expect bugs.** This is an experiment in whether asyncio can be
+> made genuinely parallel on free-threaded Python, not production software.
+> Releases are alpha and the APIs are subject to breaking changes. More to the
+> point: taking away the single-threaded loop invalidates assumptions that library
+> authors were entitled to make and never had to write down, so failures here show
+> up as races, hangs, and — where a C extension dereferences state it assumed could
+> not change underneath it — segfaults. Several such assumptions have been found
+> and put back (see [`COMPATIBILITY.md`](mt_asyncio/asyncio/COMPATIBILITY.md));
+> assume more are still out there. Do not put this in front of anything that
+> matters.
 
 > **Attribution:** mt_asyncio is derived from [TonIO](https://github.com/gi0baro/tonio)
 > by Giovanni Barillari and keeps its Rust runtime core; TonIO's own `yield`- and
@@ -30,6 +37,73 @@ coroutines run on more than one core.
 > endorsed by the TonIO project. See [NOTICE](NOTICE).
 
 > **Note:** free-threaded Python (3.14t+) and Unix systems only.
+
+## At a glance
+
+An unmodified asyncpg against a real Postgres: 20 concurrent connections each
+fetching 50,000 rows — 1,000,000 rows a run — with a per-row Python loop over
+the result. Free-threaded CPython 3.14.4, Apple M5 Max (6 performance + 12
+efficiency cores), median of 3 via `bench/pg_asyncpg_scale.py --cpu 40`:
+
+| | time | rows/s | vs stdlib |
+| --- | --- | --- | --- |
+| stdlib asyncio | 1697 ms | 589k | 1.00× |
+| mt_asyncio, 1 worker | 1723 ms | 580k | 0.99× |
+| mt_asyncio, 2 workers | 1041 ms | 961k | 1.63× |
+| mt_asyncio, 4 workers | 642 ms | 1,557k | 2.64× |
+| mt_asyncio, 8 workers | 523 ms | 1,911k | 3.24× |
+| mt_asyncio, 12 workers | 497 ms | 2,012k | **3.41×** |
+
+At one worker it is a wash, and that is the point: the runtime is not making the
+driver faster. The queries wait concurrently on any loop — what changes is that
+the row handling afterwards stops queueing up behind a single thread.
+
+Nothing was written for this. The driver is the unmodified wheel from PyPI, the
+queries are ordinary, and the whole change to the program is two lines at the
+top:
+
+```python
+import mt_asyncio.asyncio as asyncio
+asyncio.compat.install()          # before importing anything that should see it
+
+import asyncpg                    # unmodified, straight from PyPI
+
+DSN = 'postgresql://postgres@127.0.0.1/bench'
+
+# fixture, created once:
+#   create table bench_scale_rows as
+#       select g as id, (g * 7919)::bigint as v, 'row-' || g || '-payload' as t
+#       from generate_series(1, 50000) g;
+SQL = 'select id, v, t from bench_scale_rows'
+
+def handle(rows):                 # ordinary Python work, once per row
+    acc = 0
+    for rid, v, t in rows:
+        acc += rid + v + len(t)
+    return acc
+
+async def query(conn):
+    return handle(await conn.fetch(SQL))     # 50,000 rows, then work on each
+
+async def main():
+    conns = [await asyncpg.connect(DSN) for _ in range(20)]
+    # 20 queries in flight at once. The waiting overlaps on any loop; what
+    # differs is the handle() loops afterwards — stdlib asyncio has one thread
+    # to run all 20 on, so they queue behind each other. Here they do not.
+    return await asyncio.gather(*[query(c) for c in conns])
+
+asyncio.run(main(), threads=12)   # 20 queries, 1,000,000 rows, 12 workers
+```
+
+`compat.install()` points the `asyncio` namespace at mt_asyncio's implementations, so
+a library that does `import asyncio` internally gets this loop rather than
+CPython's. asyncpg then opens its connections through `create_connection` and
+talks to the network through transports exactly as it always has — it never
+learns that its callbacks and its tasks are now running on twelve threads.
+
+The synthetic suite covers the shapes this one workload cannot: CPU work between
+awaits reaches 7.34× at 16 threads, while timers and cancellation are genuinely
+slower than stdlib. See [Performance](#performance).
 
 ## Why
 
@@ -132,6 +206,15 @@ asyncio.run(main())
 
 No thread per query, so concurrency is bounded only by your connection pool. The
 cost is a reactor hop per round trip.
+
+asyncpg works the same way and takes a different route through the loop —
+`create_connection` and transports rather than `add_reader` — which is why the
+[benchmark above](#at-a-glance) uses it. Two caveats. Its C protocol assumes the
+serialization a single-threaded loop provides; the guarantees it needs are
+restored per connection (COMPATIBILITY.md §1), but getting them wrong is a
+segfault rather than an exception, so treat asyncpg here as less proven than
+psycopg. And it defaults to `ssl='prefer'`, so every connection costs an extra
+negotiation round trip against a server without TLS.
 
 **Sync driver behind `to_thread`.** One pool thread per in-flight query, capped
 by `blocking_threadpool_size` (128 by default), and no event-loop work in the
@@ -326,6 +409,15 @@ does. Two things are genuinely slower: **timers** — each `sleep()` builds a
 needs only one native waiter — and **cancellation**, which is pure coordination
 and gets *worse* with more threads. Past 6 threads this machine is scheduling
 onto efficiency cores, so the 16-thread column is not 16 equal cores.
+
+### Real drivers
+
+Synthetic workloads choose their own CPU/IO mix, so two scripts use a real
+Postgres instead. `bench/pg_asyncpg_scale.py` is the asyncpg run
+[above](#at-a-glance); it has no upstream TonIO column because `tonio-monkey`
+ships no asyncpg patch — asyncpg never calls `add_reader`, it goes through
+transports. `bench/pg_tax.py` covers psycopg, where there *is* an upstream
+comparison to make; see [`bench/README.md`](bench/README.md).
 
 Benchmarks must be run against a release build (`make build-release`); the
 scripts refuse to run on a debug one, which is several times slower.

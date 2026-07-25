@@ -1,6 +1,6 @@
 [package]
 name = "mt_asyncio"
-version = "0.1.0-alpha.1"
+version = "0.1.1-alpha.1"
 description = "A parallel asyncio runtime for free-threaded Python"
 authors = ["John Griffith <john.griffith243@gmail.com>"]
 license = "BSD-3-Clause"

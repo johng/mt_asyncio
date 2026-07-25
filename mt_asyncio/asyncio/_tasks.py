@@ -63,6 +63,9 @@ class Task(Future):
         self._fut_waiter = None
         self._must_cancel = False
         self._num_cancels_requested = 0
+        # connections this task claimed by writing to them; see
+        # `_transports.SocketTransport._mt_claim`
+        self._mt_claims = None
         loop._register_task(self)
         self._spawn()
 
@@ -133,6 +136,22 @@ class Task(Future):
                     self._must_cancel = False
         return self._num_cancels_requested
 
+    # -- connection claims --------------------------------------------------
+
+    def _mt_release_claims(self):
+        """Hand back every connection this task claimed by writing to it.
+
+        A single-threaded loop cannot run a connection's reader between a task's
+        ``write()`` and its next suspension, and protocols mutate themselves in
+        that window (see :mod:`._transports`). This is the moment that window
+        closes: called from every suspension point and once more when the task
+        finishes, in case it wrote and then returned without awaiting.
+        """
+        claims, self._mt_claims = self._mt_claims, None
+        if claims is not None:
+            for transport in claims:
+                transport._mt_release_claim(self)
+
     def set_result(self, result):
         raise RuntimeError('Task does not support set_result operation')
 
@@ -170,6 +189,7 @@ class Task(Future):
             else:
                 Future.set_result(self, result)
         finally:
+            self._mt_release_claims()
             self._loop._unregister_task(self)
 
 

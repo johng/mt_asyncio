@@ -27,12 +27,43 @@ calls ``protocol.resume_writing()``, which may call ``write()`` -- hence RLock.
 The consequence, stated plainly: **this parallelises connections, not the inside
 of one connection.** A single connection's protocol callbacks are serialised,
 which is exactly asyncio's contract; the parallelism comes from having many.
+
+Serialising the callbacks is necessary and not sufficient. The other half of
+asyncio's contract is that a callback finishes before any task it woke takes a
+step -- ``data_received`` can complete a waiter in its first line and still own
+the protocol until its last. Every reactor-entered callback below therefore runs
+inside a :func:`~._wakes.defer_wakes` region, which holds those wakes until the
+callback has returned *and* the lock is dropped. See :mod:`._wakes` for the
+asyncpg corruption that motivates it.
+
+**Claims** close the mirror image of that window. A task's ``write()`` is not
+the end of its dealings with the protocol -- asyncpg's ``bind_execute`` is::
+
+    self._bind_execute(portal_name, state.name, args_buf, limit)  # network op
+    self.last_query = state.query
+    self.statement = state          # <- after the bytes are on the wire
+    self.return_extra = return_extra
+
+On one thread the reply cannot possibly be processed before that runs: the loop
+does not get control back until the coroutine suspends. On several it can, and
+``self.statement`` is still the ``None`` the previous result left behind, so
+``_decode_row`` dereferences ``None`` as a ``PreparedStatementState`` -- an
+unchecked C-level call in a release build, i.e. a segfault rather than an
+``AttributeError``.
+
+So ``write()`` *claims* the connection for the writing task, and the claim is
+handed back at that task's next suspension point (see ``Task._mt_release_claims``,
+called from ``Future.__await__`` and ``_yield_now``). While a claim is
+outstanding, ``_read_ready`` declines and re-queues itself. Between the two
+mechanisms, a connection's protocol callbacks and the task steps that drive them
+are as strictly ordered as they are on a single-threaded loop.
 """
 
 from __future__ import annotations
 
 import inspect
 import threading
+import time
 from asyncio.selector_events import _SelectorSocketTransport, _SelectorTransport
 
 
@@ -42,6 +73,16 @@ except ImportError:  # pragma: no cover
     _HAS_SENDMSG = False
 
 from asyncio.base_events import _set_nodelay
+
+from ._context import _current_task
+from ._wakes import defer_wakes, pending_wakes
+
+
+# Liveness backstop, not the mechanism. A claim is handed back within a few
+# statements, so this is never reached in practice; it is here so that a claim
+# which somehow never gets released degrades to the old behaviour after a bounded
+# delay instead of wedging the connection for good.
+_MAX_READ_DEFER = 0.05
 
 
 # CPython 3.15 gives transports a `context`: the contextvars.Context the
@@ -72,6 +113,12 @@ class SocketTransport(_SelectorSocketTransport):
         # connection_made returned. We run the grandparent and sequence the
         # startup ourselves in `_startup`.
         self._read_ready_cb = None
+        # claim state: tasks currently between a write() on this connection and
+        # their next suspension, and whether a read had to stand aside for them
+        self._claim_lock = threading.Lock()
+        self._claims: set = set()
+        self._read_deferred = False
+        self._read_defer_since = None
         if _HAS_TRANSPORT_CONTEXT:
             # sets self._context, which the inherited _add_reader/_add_writer/
             # _call_soon helpers then thread through to the loop
@@ -92,39 +139,95 @@ class SocketTransport(_SelectorSocketTransport):
     # -- startup ------------------------------------------------------------
 
     def _startup(self, waiter):
-        with self._lock:
-            self._protocol.connection_made(self)
-            # only start reading once connection_made has returned
-            if not self._closing:
-                self._add_reader(self._sock_fd, self._read_ready)
-        if waiter is not None and not waiter.cancelled():
-            waiter.set_result(None)
+        with defer_wakes():
+            with self._lock:
+                self._protocol.connection_made(self)
+                # only start reading once connection_made has returned
+                if not self._closing:
+                    self._add_reader(self._sock_fd, self._read_ready)
+            if waiter is not None and not waiter.cancelled():
+                waiter.set_result(None)
 
     # -- reactor-entered callbacks ------------------------------------------
 
     def _locked_write_ready(self):
-        with self._lock:
-            impl = self._write_impl
-            if impl is not None:
-                impl()
+        with defer_wakes():
+            with self._lock:
+                impl = self._write_impl
+                if impl is not None:
+                    impl()
 
     def _read_ready(self):
-        with self._lock:
-            cb = self._read_ready_cb
-            if cb is not None:
-                cb()
+        with self._claim_lock:
+            if self._claims:
+                # a task is between its write() and its next suspension: on a
+                # single-threaded loop we could not have been reached yet, and
+                # the protocol is still mutating itself. Stand aside; the claim
+                # being handed back re-queues us.
+                now = time.monotonic()
+                if self._read_defer_since is None:
+                    self._read_defer_since = now
+                if now - self._read_defer_since < _MAX_READ_DEFER:
+                    self._read_deferred = True
+                    return
+            self._read_deferred = False
+            self._read_defer_since = None
+        with defer_wakes():
+            with self._lock:
+                cb = self._read_ready_cb
+                if cb is not None:
+                    cb()
+
+    # -- claims -------------------------------------------------------------
+
+    def _mt_claim(self):
+        """Hold this connection's reader until the writing task suspends."""
+        if pending_wakes() is not None:
+            # we are inside a protocol callback, which is already serialised
+            # against the reader -- and the context's "current task" is not the
+            # one running, so claiming on its behalf could never be released
+            return
+        task = _current_task.get()
+        if task is None or task.done() or task._fut_waiter is not None:
+            # `_fut_waiter` set means the task is parked, so it is not the one
+            # running this code -- a callback dispatched with a copied context
+            # names whichever task queued it, and a claim taken on behalf of a
+            # parked task would have nobody to hand it back
+            return
+        claims = task._mt_claims
+        if claims is None:
+            task._mt_claims = [self]
+        elif self in claims:
+            return
+        else:
+            claims.append(self)
+        with self._claim_lock:
+            self._claims.add(task)
+
+    def _mt_release_claim(self, task):
+        with self._claim_lock:
+            self._claims.discard(task)
+            if self._claims or not self._read_deferred:
+                return
+            self._read_deferred = False
+        loop = self._loop
+        if loop is not None and not self._closing:
+            loop.call_soon(self._read_ready)
 
     # -- app-facing surface -------------------------------------------------
 
     def write(self, data):
+        self._mt_claim()
         with self._lock:
             super().write(data)
 
     def writelines(self, list_of_data):
+        self._mt_claim()
         with self._lock:
             super().writelines(list_of_data)
 
     def write_eof(self):
+        self._mt_claim()
         with self._lock:
             super().write_eof()
 
@@ -167,7 +270,7 @@ class SocketTransport(_SelectorSocketTransport):
             super()._force_close(exc)
 
     def _call_connection_lost(self, exc):
-        with self._lock:
+        with defer_wakes(), self._lock:
             loop, fd = self._loop, self._sock_fd
             # `_write_ready = None` upstream; ours is the wrapper, so drop the
             # implementation it dispatches to as well
