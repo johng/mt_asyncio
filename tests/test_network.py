@@ -768,3 +768,48 @@ def test_tls_large_transfer(aio, tls_certs):
             await server.wait_closed()
 
     assert aio.run(main()) == b'k' * size
+
+
+def test_tls_survives_repeated_read_pauses(aio, tls_certs):
+    """``sslproto`` defers two callbacks straight back into its state machine.
+
+    ``_resume_reading`` schedules a closure and ``_do_read__buffered`` schedules
+    ``self._do_read``; neither goes through a method the connection lock wraps,
+    so both land on an arbitrary worker with nothing held. What they reach is::
+
+        data = self._outgoing.read()   # take what the BIO has
+        self._transport.write(data)    # and put it on the wire
+
+    Two threads in there take a slice each and write them back in whichever
+    order they reach the socket, and the peer reports ``RECORD_LAYER_FAILURE``
+    or reads short where a record boundary was lost.
+
+    A small stream limit makes the reader pause and resume constantly, which is
+    what schedules those callbacks in the first place. The window is still
+    narrow, hence the repeats: one round failed maybe one time in six.
+    """
+    server_ctx, client_ctx = tls_certs
+    size = 1 << 20
+    rounds = 6
+    limit = 1 << 14  # a quarter of the stream default, so pauses are frequent
+
+    async def main():
+        async def handle(reader, writer):
+            writer.write(b'k' * size)
+            await writer.drain()
+            writer.close()
+
+        server = await aio.start_server(handle, '127.0.0.1', 0, ssl=server_ctx, limit=limit)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            for _ in range(rounds):
+                reader, writer = await aio.open_connection(
+                    '127.0.0.1', port, ssl=client_ctx, server_hostname='localhost', limit=limit
+                )
+                assert await aio.wait_for(reader.readexactly(size), TIMEOUT) == b'k' * size
+                writer.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    aio.run(main())
