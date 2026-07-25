@@ -1,15 +1,56 @@
 name: release
 
+# Releases follow main. `[project] version` in pyproject.toml is the trigger:
+# bump it in a PR, and merging that PR publishes. Nothing to tag by hand --
+# `github-release` creates the tag once PyPI has accepted the upload.
 on:
   push:
-    tags:
-      - v*.*.*
+    branches:
+      - main
+  # for re-running a release that failed before the tag was created
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   PY_ALL: 3.14t 3.15t
 
 jobs:
+  # The gate, and the reason merging to main is not ruinous: an ordinary merge
+  # costs this one job and stops. Everything below runs only when pyproject.toml
+  # carries a version that has never been tagged.
+  version:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+      tag: ${{ steps.check.outputs.tag }}
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0  # tags are how we know what is already out
+    - id: check
+      run: |
+        set -euo pipefail
+        # parsed, not grepped: this is the string the wheels will carry, and a
+        # near-miss here would tag one version and publish another
+        version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+        tag="v${version}"
+        echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+        if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+          echo "release=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::${tag} is already released -- nothing to do"
+        else
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::releasing ${tag}"
+        fi
+
   sdist:
+    needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -27,6 +68,8 @@ jobs:
 
   wheels:
     name: wheel ${{ matrix.platform || matrix.os }}(${{ matrix.target }}) - ${{ matrix.manylinux || 'auto' }}
+    needs: version
+    if: needs.version.outputs.release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -143,9 +186,9 @@ jobs:
   release:
     name: publish to pypi
     runs-on: ubuntu-latest
-    # needs: [ sdist, wheels, wheels-pgo ]
-    needs: [ sdist, wheels ]
-    if: github.ref_type == 'tag'
+    # needs: [ version, sdist, wheels, wheels-pgo ]
+    needs: [ version, sdist, wheels ]
+    if: needs.version.outputs.release == 'true'
     environment:
       name: pypi
       url: https://pypi.org/p/mt-asyncio
@@ -163,11 +206,13 @@ jobs:
         with:
           skip-existing: true
 
+  # Last, so that the tag means "this version is on PyPI". A run that dies
+  # before here leaves no tag, which is what makes it safe to just merge again.
   github-release:
     name: github release
     runs-on: ubuntu-latest
-    needs: [ release ]
-    if: github.ref_type == 'tag'
+    needs: [ version, release ]
+    if: needs.version.outputs.release == 'true'
     permissions:
       contents: write
 
@@ -181,15 +226,18 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
           # semver pre-releases carry a hyphen (v0.1.0-alpha.1); finals do not
-          case "$GITHUB_REF_NAME" in
+          case "$TAG" in
             *-*) prerelease=--prerelease ;;
             *)   prerelease= ;;
           esac
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
+          # --target creates the tag: nothing tagged this commit before now
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
             --generate-notes \
             $prerelease \
             dist/*

@@ -1,7 +1,7 @@
 [project]
 name = 'mt-asyncio'
 authors = [
-    { name = 'John Griffith', email = 'john.griffith243@gmail.com' }
+    { name = 'John Griffith', email = 'me@joh.ng' }
 ]
 classifiers = [
     'Development Status :: 3 - Alpha',
@@ -18,12 +18,17 @@ classifiers = [
     'Programming Language :: Rust',
 ]
 
+# the released version, and the release trigger: bump it in a PR and merging
+# that PR publishes. Declared here rather than left dynamic so there is one
+# obvious place to change and one for CI to read (Cargo.toml keeps its own
+# version for the Rust crate, which is not published anywhere).
+version = '0.1.0-alpha.1'
+
 dynamic = [
     'description',
     'keywords',
     'license',
     'readme',
-    'version',
 ]
 
 requires-python = '>=3.14'
