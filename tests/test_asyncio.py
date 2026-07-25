@@ -4,6 +4,7 @@ Plain synchronous tests driving real asyncio-style coroutines via
 ``mt_asyncio.asyncio.run``. Require a free-threaded build.
 """
 
+import os
 import socket
 import threading
 import time
@@ -97,6 +98,29 @@ def test_create_task_and_current_task():
 
 
 def test_true_multicore_parallelism():
+    """CPU-bound tasks must genuinely overlap, not take turns.
+
+    Sized to the machine on purpose. With more tasks than cores the best
+    achievable ratio is not ``1 / tasks`` but ``ceil(tasks / cores) / tasks``,
+    so a fixed four tasks on a three-core runner tops out at 0.5 -- which sat
+    directly on the old 0.6 threshold and failed there about as often as it
+    passed. Matching the fan-out to the core count puts the ideal back at
+    ``1 / cores`` wherever this runs.
+
+    The bar is halfway between perfect scaling and none, so it stays clear of
+    both: a runtime that had lost parallel stepping scores ~1.0 and fails on any
+    machine. This is a correctness check, not a benchmark -- how *close* to
+    ideal we get is what ``bench/`` is for.
+
+    Note there is no ``threads=`` here, and the ``threads=4`` this used to pass
+    was doing nothing: ``conftest`` builds the process-wide runtime, and the
+    first caller fixes its worker count for good. The fan-out below is over
+    those workers.
+    """
+    cores = min(4, os.process_cpu_count() or 1)
+    if cores < 2:
+        pytest.skip('parallel stepping cannot be observed on a single core')
+
     def burn(n):
         x = 0
         for i in range(n):
@@ -108,17 +132,25 @@ def test_true_multicore_parallelism():
 
     async def main():
         s = time.monotonic()
-        for _ in range(4):
+        for _ in range(cores):
             await cpu()
         serial = time.monotonic() - s
         s = time.monotonic()
-        await aio.gather(*[cpu() for _ in range(4)])
+        await aio.gather(*[cpu() for _ in range(cores)])
         parallel = time.monotonic() - s
         return serial, parallel
 
-    serial, parallel = aio.run(main(), threads=4)
-    # genuine parallel stepping: 4 CPU-bound tasks must beat running them serially
-    assert parallel < serial * 0.6
+    # interference on a shared runner only ever makes the parallel leg look
+    # worse, so the best of a few attempts estimates the floor we care about;
+    # a single sample measures whatever else the machine was doing
+    ratios = []
+    for _ in range(3):
+        serial, parallel = aio.run(main())
+        ratios.append(parallel / serial)
+
+    best = min(ratios)
+    bar = (1.0 / cores + 1.0) / 2
+    assert best < bar, f'{cores} tasks on {cores} cores: parallel/serial {best:.2f}, need < {bar:.2f}'
 
 
 def test_wait_for_timeout():
