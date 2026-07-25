@@ -1,0 +1,85 @@
+import time
+
+import pytest
+
+import tonio.colored as tonio
+
+
+def test_time(run):
+    stack = []
+
+    async def _run():
+        stack.append(tonio.time.time())
+        await tonio.yield_now()
+        stack.append(tonio.time.time())
+
+    run(_run())
+    assert stack[1] > stack[0]
+
+
+def test_sleep(run):
+    async def _run():
+        start = time.monotonic()
+        await tonio.spawn(tonio.sleep(0.05), tonio.sleep(0.1))
+        return time.monotonic() - start
+
+    assert run(_run()) >= 0.1
+
+
+def test_timeout(run):
+    stack = []
+
+    async def _sleep(x):
+        await tonio.time.sleep(x)
+        stack.append(x)
+        return 3
+
+    async def _run():
+        out1, success1 = await tonio.time.timeout(_sleep(0.2), 0.3)
+        out2, success2 = await tonio.time.timeout(_sleep(0.2), 0.1)
+        await tonio.time.sleep(1)
+        return (out1, out2, success1, success2)
+
+    out1, out2, success1, success2 = run(_run())
+    assert out1 == 3
+    assert out2 is None
+    assert success1 is True
+    assert success2 is False
+    assert len(stack) == 1
+
+
+def test_timeout_err_transparent(run):
+    async def _err():
+        await tonio.yield_now()
+        raise RuntimeError
+
+    async def _run():
+        with pytest.raises(RuntimeError):
+            await tonio.time.timeout(_err(), 0.3)
+
+    run(_run())
+
+
+def test_interval(run):
+    stack = []
+    event = tonio.Event()
+
+    async def _scheduler(interval):
+        times = 0
+        t0 = tonio.time.time()
+        while times < 5:
+            await interval.tick()
+            t = tonio.time.time()
+            stack.append((t, (t - t0) / (times or 1)))
+            await tonio.sleep(0.01)
+            times += 1
+        event.set()
+
+    async def _run():
+        interval = tonio.time.interval(0.02)
+        tonio.spawn(_scheduler(interval))
+        await event.wait()
+
+    run(_run())
+    assert len(stack) == 5
+    assert all(v[1] >= 0.02 for v in stack[1:])
