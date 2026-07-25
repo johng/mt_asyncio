@@ -108,8 +108,11 @@ class NetworkMixin:
 
     # -- transport factories ------------------------------------------------
 
-    def _make_socket_transport(self, sock, protocol, waiter=None, *, extra=None, server=None):
-        return SocketTransport(self, sock, protocol, waiter, extra, server)
+    # `context` is passed by CPython 3.15's create_connection/_accept_connection2
+    # and absent on 3.14; the transports handle either, so it is simply accepted
+    # and forwarded here
+    def _make_socket_transport(self, sock, protocol, waiter=None, *, extra=None, server=None, context=None):
+        return SocketTransport(self, sock, protocol, waiter, extra, server, context=context)
 
     def _make_ssl_transport(
         self,
@@ -124,6 +127,7 @@ class NetworkMixin:
         server=None,
         ssl_handshake_timeout=None,
         ssl_shutdown_timeout=None,
+        context=None,
     ):
         from ._tls import make_ssl_transport
 
@@ -139,6 +143,7 @@ class NetworkMixin:
             server=server,
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
+            context=context,
         )
 
     # -- outbound -----------------------------------------------------------

@@ -388,7 +388,7 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
     def call_soon(self, cb, *args, context=None):
         self._check_closed()
         self._ensure_reactor()
-        h = Handle(cb, args, context or _copy_context())
+        h = Handle(cb, args, _handle_context(context))
         get_runtime()._call_soon(h._run)
         return h
 
@@ -400,7 +400,7 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
     def call_at(self, when, cb, *args, context=None):
         self._check_closed()
         self._ensure_reactor()
-        h = TimerHandle(when, cb, args, context or _copy_context())
+        h = TimerHandle(when, cb, args, _handle_context(context))
         delay_us = max(0, round((when - self.time()) * 1_000_000))
 
         async def _timer():
@@ -606,11 +606,14 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
         self._ensure_fd_no_transport(fd)
         return self._remove_writer(fd)
 
-    def _add_reader(self, fd, callback, *args):
-        self._add_fd_callback(fd, False, callback, args)
+    # `context` is keyword-only and 3.15-only at the call sites that pass it
+    # (a transport forwards the context its connection was opened in), but
+    # accepting it everywhere costs nothing and keeps one signature.
+    def _add_reader(self, fd, callback, *args, context=None):
+        self._add_fd_callback(fd, False, callback, args, context)
 
-    def _add_writer(self, fd, callback, *args):
-        self._add_fd_callback(fd, True, callback, args)
+    def _add_writer(self, fd, callback, *args, context=None):
+        self._add_fd_callback(fd, True, callback, args, context)
 
     def _remove_reader(self, fd):
         return self._remove_fd_callback(fd, False)
@@ -618,11 +621,11 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
     def _remove_writer(self, fd):
         return self._remove_fd_callback(fd, True)
 
-    def _add_fd_callback(self, fileobj, writer, callback, args):
+    def _add_fd_callback(self, fileobj, writer, callback, args, context=None):
         self._check_closed()
         self._ensure_reactor()
         fd = _fileno(fileobj)
-        context = _copy_context()
+        context = _handle_context(context)
         with self._sios_lock:
             reg = self._registration(fd)
             handle = _FdHandle(fd, reg.sio, writer, callback, args, context)
@@ -771,6 +774,26 @@ def _copy_context():
     import contextvars
 
     return contextvars.copy_context()
+
+
+def _handle_context(context):
+    """The context a single scheduled callback will run in.
+
+    asyncio lets a caller pin a callback to a particular ``contextvars.Context``,
+    and CPython 3.15 leans on that internally: a transport now remembers the
+    context its connection was created in and hands it to every ``call_soon`` and
+    ``_add_reader`` it makes, so protocol callbacks see the contextvars the
+    opener set.
+
+    A ``Context`` may only be entered by one thread at a time -- ``Context.run``
+    on one another thread is already inside raises ``RuntimeError: cannot enter
+    context`` -- and our callbacks really do run at the same moment on different
+    workers (a transport's reader and writer handles, say). So a supplied context
+    is a *template*: each handle takes its own copy. Reads see everything the
+    caller set; writes made inside one callback do not leak into the next, which
+    under parallel dispatch is the only well-defined answer available.
+    """
+    return context.copy() if context is not None else _copy_context()
 
 
 def _set_result_unless_done(fut, *args):
