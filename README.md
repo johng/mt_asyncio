@@ -4,6 +4,13 @@ mt_asyncio is a **parallel asyncio runtime for free-threaded Python**: one event
 that steps asyncio tasks across many OS threads, written in Rust on top of the
 [mio crate](https://github.com/tokio-rs/mio).
 
+```
+pip install --pre mt-asyncio
+```
+
+Releases are alpha for now, so `--pre` is required until the first stable one.
+Requires a free-threaded CPython build (`python3.14t` or `python3.15t`).
+
 ```python
 import mt_asyncio.asyncio as asyncio
 
@@ -121,16 +128,6 @@ The trade-off is stated up front, because it is the one thing that changes:
 exclusion (everything runs on the loop thread); mt_asyncio does not. Shared state
 touched from tasks or callbacks needs a lock — the ones in `mt_asyncio.asyncio` are
 genuinely cross-thread. This is the price of using multiple cores.
-
-## Install
-
-```
-pip install --pre mt-asyncio
-```
-
-Releases are alpha for now, so `--pre` is required until the first stable one.
-
-Requires a free-threaded CPython build (`python3.14t` or `python3.15t`).
 
 ## Usage
 
