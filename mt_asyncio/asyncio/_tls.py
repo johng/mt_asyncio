@@ -23,7 +23,7 @@ it; this module adds it to directions 2 and 3.
 from __future__ import annotations
 
 import threading
-from asyncio.sslproto import SSLProtocol as _SSLProtocol, _SSLProtocolTransport
+from asyncio.sslproto import SSLProtocol as _SSLProtocol, SSLProtocolState, _SSLProtocolTransport
 
 from ._transports import SocketTransport
 
@@ -99,7 +99,54 @@ class SSLProtocol(_SSLProtocol):
             self._app_transport_created = True
         return self._app_transport
 
-    # -- timer callbacks: the one path not already inside the lock ----------
+    # -- deferred callbacks: the paths not already inside the lock ----------
+    #
+    # Every *method* entry into the state machine is wrapped somewhere -- by the
+    # raw transport (direction 1), by SSLProtocolTransport (direction 2), or
+    # below (direction 3). What escapes all three is a handle `sslproto` hands
+    # to `call_soon` for later: by the time a worker picks it up, whatever held
+    # the lock has long since let go.
+    #
+    # There are two, and both re-enter the state machine directly:
+    #
+    #   _do_read__buffered  ->  call_soon(self._do_read)
+    #   _resume_reading     ->  call_soon(resume)   # a nested closure
+    #
+    # The damage is not subtle. `_do_read` reaches `_process_outgoing`, which is
+    #
+    #     data = self._outgoing.read()   # take what the BIO has
+    #     self._transport.write(data)    # and put it on the wire
+    #
+    # so two threads in there take one slice each and write them back in
+    # whichever order they get to the socket. The peer sees a mangled record
+    # stream -- `SSLError: RECORD_LAYER_FAILURE`, or a short read where a
+    # record boundary was lost -- on maybe one connection in ten under load.
+
+    def _do_read(self):
+        # covers `call_soon(self._do_read)`; every other caller already holds
+        # the lock, and it is an RLock, so those are free
+        with self._lock:
+            super()._do_read()
+
+    def _resume_reading(self):
+        # upstream defers a closure that re-tests the state and calls
+        # _do_read/_do_flush/_do_shutdown. Same handle, same three branches,
+        # except the test and the call both happen under the lock -- reading
+        # _state outside it would just move the race one line up.
+        if self._app_reading_paused:
+            self._app_reading_paused = False
+            self._loop.call_soon(self._resume_reading_locked)
+
+    def _resume_reading_locked(self):
+        with self._lock:
+            if self._state == SSLProtocolState.WRAPPED:
+                self._do_read()
+            elif self._state == SSLProtocolState.FLUSHING:
+                self._do_flush()
+            elif self._state == SSLProtocolState.SHUTDOWN:
+                self._do_shutdown()
+
+    # -- timer callbacks ----------------------------------------------------
 
     def _check_handshake_timeout(self):
         with self._lock:
