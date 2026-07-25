@@ -40,15 +40,29 @@ app under a real server on the two arms that can host one, so the hand-written
 server can be shown to be in the right ballpark rather than a strawman. tonio
 cannot appear there at all.
 
-Workloads -- the "tiny realistic bit of work" is the point:
+Workloads:
 
   ping      an empty handler. The floor: HTTP parse, routing, response encode.
-  compute   the realistic one. Path and query params validated, ~32 order lines
-            aggregated in Python, a pydantic response model serialised. This is
-            what a JSON endpoint does between awaits, and it is the thing that
-            queues behind a single thread on stdlib asyncio.
+  compute   the realistic one. Path and query params validated, order lines
+            aggregated in Python, a pydantic response model serialised.
   pg        the same handler with the rows coming from Postgres instead of
             memory, so a real driver and a real socket are in the request path.
+  raw       the same aggregate reached without FastAPI -- a control on how much
+            of the scaling limit is the framework rather than the runtime.
+
+**The number you get is a function of how much work the handler does, and it is
+worth reading that before quoting any of this.** A request costs a fixed amount
+-- read the socket, parse HTTP, route, validate, serialise, write -- plus
+whatever the handler does. Only part of that fixed cost is Python that
+parallelises. So the speedup is Amdahl's, and the two dials move the parallel
+fraction directly:
+
+  --lines N   order lines the handler aggregates (default 32)
+  --cpu N     extra CPU iterations burnt in the handler, `pg_tax.py`'s kernel
+
+On this machine the default (a genuinely tiny handler) is 1.3-1.5x stdlib, and
+`--cpu 50000` is 6.35x. Neither is the "real" number; the curve is (see
+`bench/README.md`).
 
 Setup::
 
@@ -63,8 +77,9 @@ Setup::
 Usage::
 
     python bench/fastapi_tax.py
-    python bench/fastapi_tax.py -w compute --threads 1 2 4 8
-    python bench/fastapi_tax.py --arms stdlib mt --conns 16
+    python bench/fastapi_tax.py -w compute --threads 1 2 4 8 12 --cpu 20000
+    python bench/fastapi_tax.py -w compute raw --lines 512   # framework control
+    python bench/fastapi_tax.py --arms stdlib mt --conns 32
     python bench/fastapi_tax.py --json bench/results/fastapi_tax.json
 """
 
@@ -87,10 +102,18 @@ import traceback
 
 DEFAULT_DSN = 'postgresql://postgres:bench@127.0.0.1:55432/bench'
 
-#: rows per order, and how many customers the fixture holds. 32 lines is a
-#: plausible order and keeps the per-request Python work in the tens of
-#: microseconds -- small enough that the HTTP and framework cost still dominates
-#: (which is the honest shape of a real service) and large enough to be there.
+#: order lines per request (`--lines`), and how many customers the fixture holds.
+#:
+#: This is the dial that decides the whole answer, so it is worth being explicit
+#: about. A request costs a fixed amount -- read the socket, parse HTTP, route,
+#: validate, serialise, write -- plus the handler's loop over `lines` rows. Only
+#: some of that fixed cost is Python that parallelises; the socket and reactor
+#: work does not. So the achievable speedup is Amdahl's, and `lines` moves the
+#: parallel fraction directly.
+#:
+#: 32 is a plausible order and the default, which makes the default table the
+#: *pessimistic* case rather than the flattering one. `--lines 256` is what a
+#: report endpoint or a serialiser over a page of results looks like.
 LINES = 32
 CUSTOMERS = 512
 
@@ -106,10 +129,10 @@ STATUSES = ('picked', 'packed', 'shipped', 'held')
 # ---------------------------------------------------------------------------
 
 
-def _fixture_rows(customer_id: int) -> list[tuple[str, int, int, str]]:
+def _fixture_rows(customer_id: int, lines: int) -> list[tuple[str, int, int, str]]:
     """The order lines for a customer -- deterministic, so every arm sees the same."""
     rows = []
-    for i in range(LINES):
+    for i in range(lines):
         seed = customer_id * 7919 + i * 104729
         rows.append(
             (
@@ -122,7 +145,16 @@ def _fixture_rows(customer_id: int) -> list[tuple[str, int, int, str]]:
     return rows
 
 
-FIXTURE = {c: _fixture_rows(c) for c in range(CUSTOMERS)}
+def build_fixture(lines: int) -> dict:
+    return {c: _fixture_rows(c, lines) for c in range(CUSTOMERS)}
+
+
+def _burn(n):
+    """`pg_tax.py`'s CPU kernel, so a `--cpu` here means the same thing it does there."""
+    x = 0
+    for i in range(n):
+        x += i * i
+    return x
 
 
 def summarise(customer_id: int, rows) -> dict:
@@ -148,10 +180,47 @@ def summarise(customer_id: int, rows) -> dict:
     }
 
 
-def build_app(workload: str, pool=None):
+def build_raw_app(lines: int, cpu: int):
+    """The same handler work, reached without FastAPI. A control, not a proposal.
+
+    `raw` answers the question the FastAPI numbers cannot: when the parallel
+    speedup stops short, is it the runtime failing to use the cores, or the
+    application's own scaling? This ASGI callable does the identical `summarise`
+    over the identical rows and returns the identical JSON, but reaches it
+    through a dict lookup instead of starlette's routing and pydantic's
+    validation -- so it touches a fraction of the shared, mutable-refcount object
+    graph a FastAPI request walks. Run both and the gap between their *scaling
+    curves* is what the framework costs in parallel, as opposed to per request.
+    """
+    import json as _json
+
+    fixture = build_fixture(lines)
+    head = [(b'content-type', b'application/json')]
+
+    async def app(scope, receive, send):
+        path = scope['path']
+        if path == '/ping':
+            body = b'{"ok":true}'
+        else:
+            customer_id = int(path.rsplit('/', 1)[1])
+            body = _json.dumps(summarise(customer_id, fixture[customer_id % CUSTOMERS][:lines])).encode()
+            if cpu:
+                _burn(cpu)
+        await send({'type': 'http.response.start', 'status': 200, 'headers': head})
+        await send({'type': 'http.response.body', 'body': body})
+
+    return app
+
+
+def build_app(workload: str, lines: int = LINES, cpu: int = 0, pool=None):
     """The FastAPI app. Identical on every arm; only `pool` differs (pg only)."""
+    if workload == 'raw':
+        return build_raw_app(lines, cpu)
+
     from fastapi import FastAPI
     from pydantic import BaseModel
+
+    fixture = build_fixture(lines)
 
     class Summary(BaseModel):
         customer_id: int
@@ -170,21 +239,27 @@ def build_app(workload: str, pool=None):
     if workload == 'pg':
 
         @app.get('/orders/{customer_id}', response_model=Summary)
-        async def orders(customer_id: int, limit: int = LINES):
+        async def orders(customer_id: int, limit: int = lines):
             async with pool.borrow() as conn:
                 cur = await conn.execute(
                     'select sku, qty, unit_price, status from bench_orders where customer_id = %s limit %s',
                     (customer_id, limit),
                 )
                 rows = await cur.fetchall()
-            return summarise(customer_id, rows)
+            result = summarise(customer_id, rows)
+            if cpu:
+                _burn(cpu)
+            return result
 
     else:
 
         @app.get('/orders/{customer_id}', response_model=Summary)
-        async def orders(customer_id: int, limit: int = LINES):
-            rows = FIXTURE[customer_id % CUSTOMERS][:limit]
-            return summarise(customer_id, rows)
+        async def orders(customer_id: int, limit: int = lines):
+            rows = fixture[customer_id % CUSTOMERS][:limit]
+            result = summarise(customer_id, rows)
+            if cpu:
+                _burn(cpu)
+            return result
 
     return app
 
@@ -461,7 +536,7 @@ async def _open_pool(dsn, size):
     return Pool(conns)
 
 
-def serve(arm: str, workload: str, port: int, threads: int, dsn: str, pool_size: int) -> None:
+def serve(arm: str, workload: str, port: int, threads: int, dsn: str, pool_size: int, lines: int, cpu: int) -> None:
     """Run one server arm in the foreground until killed. Prints `READY <port>`."""
     if arm.startswith('mt'):
         import mt_asyncio.asyncio as maio
@@ -483,7 +558,7 @@ def serve(arm: str, workload: str, port: int, threads: int, dsn: str, pool_size:
 
     async def make_app():
         pool = await _open_pool(dsn, pool_size) if workload == 'pg' else None
-        return build_app(workload, pool=pool)
+        return build_app(workload, lines=lines, cpu=cpu, pool=pool)
 
     if arm.endswith('-uvicorn'):
         _serve_uvicorn(aio, make_app, port, threads)
@@ -658,12 +733,14 @@ CLIENTS = {'oha': _load_oha, 'python': _load_python}
 class Server:
     """A server arm in a subprocess, up and accepting by the time __enter__ returns."""
 
-    def __init__(self, arm, workload, threads, dsn, pool_size, port):
+    def __init__(self, arm, workload, threads, dsn, pool_size, port, lines, cpu):
         self.arm = arm
         self.workload = workload
         self.threads = threads
         self.dsn = dsn
         self.pool_size = pool_size
+        self.lines = lines
+        self.cpu = cpu
         self.port = port
         self.proc = None
         self.errlines = []
@@ -687,6 +764,10 @@ class Server:
                 self.dsn,
                 '--pool-size',
                 str(self.pool_size),
+                '--lines',
+                str(self.lines),
+                '--cpu',
+                str(self.cpu),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -739,7 +820,8 @@ class Server:
 
 WORKLOADS = {
     'ping': ('/ping', 'empty handler -- the HTTP + framework floor'),
-    'compute': ('/orders/{c}', 'validate, aggregate 32 lines, serialise a response model'),
+    'compute': ('/orders/{c}', 'validate, aggregate the order lines, serialise a response model'),
+    'raw': ('/orders/{c}', 'the same aggregate without FastAPI — a control on what the framework costs in parallel'),
     'pg': ('/orders/{c}', 'the same handler, rows from Postgres'),
 }
 
@@ -752,9 +834,11 @@ ARMS = {
 }
 
 
-def _url(workload, port):
+def _url(workload, port, lines):
     path = WORKLOADS[workload][0].replace('{c}', '7')
-    return f'http://127.0.0.1:{port}{path}'
+    # `limit` is sent explicitly so the URL records the weight the number was
+    # measured at, rather than relying on the server's default matching.
+    return f'http://127.0.0.1:{port}{path}' + (f'?limit={lines}' if '{c}' in WORKLOADS[workload][0] else '')
 
 
 def _probe(url):
@@ -781,9 +865,9 @@ def _probe(url):
 
 def _measure(arm, workload, threads, args, client):
     port = _free_port()
-    server = Server(arm, workload, threads, args.dsn, args.conns, port)
+    server = Server(arm, workload, threads, args.dsn, args.conns, port, args.lines, args.cpu)
     with server:
-        url = _url(workload, port)
+        url = _url(workload, port, args.lines)
         try:
             body = _probe(url)
             for _ in range(args.warmup):
@@ -861,7 +945,7 @@ def _emit(lines, out):
         out.append(line)
 
 
-def setup_db(dsn):
+def setup_db(dsn, lines):
     """Create the `pg` workload's fixture table."""
     import psycopg
 
@@ -873,7 +957,7 @@ def setup_db(dsn):
             ' qty int not null, unit_price int not null, status text not null)'
         )
         with conn.cursor().copy('copy bench_orders (customer_id, sku, qty, unit_price, status) from stdin') as copy:
-            for customer_id, rows in FIXTURE.items():
+            for customer_id, rows in build_fixture(lines).items():
                 for row in rows:
                     copy.write_row((customer_id, *row))
         conn.execute('create index on bench_orders (customer_id)')
@@ -887,6 +971,18 @@ def main():
     parser.add_argument('-t', '--threads', nargs='+', type=int, default=[1, 2, 4, 8], metavar='N')
     parser.add_argument('-a', '--arms', nargs='+', default=['stdlib', 'mt', 'tonio'], metavar='NAME')
     parser.add_argument('-c', '--conns', type=int, default=16, help='client connections (also the pg pool size)')
+    parser.add_argument(
+        '--lines',
+        type=int,
+        default=LINES,
+        help='order lines the handler aggregates per request -- the parallel fraction dial',
+    )
+    parser.add_argument(
+        '--cpu',
+        type=int,
+        default=0,
+        help='extra CPU iterations burnt in the handler, `pg_tax.py`-style (0 = none)',
+    )
     parser.add_argument('-n', '--requests', type=int, default=20000)
     parser.add_argument('-r', '--repeat', type=int, default=3)
     parser.add_argument('--warmup', type=int, default=1)
@@ -905,11 +1001,11 @@ def main():
     args = parser.parse_args()
 
     if args.serve:
-        serve(args.arm, args.workload[0], args.port, args.wthreads, args.dsn, args.pool_size)
+        serve(args.arm, args.workload[0], args.port, args.wthreads, args.dsn, args.pool_size, args.lines, args.cpu)
         return
 
     if args.setup_db:
-        setup_db(args.dsn)
+        setup_db(args.dsn, args.lines)
         return
 
     unknown = [w for w in args.workload if w not in WORKLOADS]
@@ -946,7 +1042,8 @@ def main():
             f'- python {vers["python"]} (free-threaded: {vers["freethreaded"]}), {vers["platform"]}, {vers["cpus"]} cpus',
             (
                 f'- {args.requests} requests over {args.conns} keep-alive connections, client `{client_name}`, '
-                f'median of {args.repeat} run(s) after {args.warmup} warmup'
+                f'median of {args.repeat} run(s) after {args.warmup} warmup, '
+                f'{args.lines} lines per request, cpu={args.cpu}'
             ),
             '',
             'One hand-written HTTP/1.1 server, shared by every arm bar the `-uvicorn` ones;',

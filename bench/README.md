@@ -315,7 +315,7 @@ python bench/fastapi_tax.py --setup-db      # fixture table for the `pg` workloa
 python bench/fastapi_tax.py --json bench/results/fastapi_tax.json
 ```
 
-Three workloads, all `GET`, all differing only in what the handler does:
+Four workloads, all `GET`, all differing only in what the handler does:
 
 - **`ping`** — an empty handler. The floor: HTTP parse, routing, response encode.
 - **`compute`** — the realistic one, and the point of the exercise. Path and
@@ -324,6 +324,12 @@ Three workloads, all `GET`, all differing only in what the handler does:
   queues behind a single thread on stdlib asyncio.
 - **`pg`** — the same handler with the rows coming from Postgres, so a real
   driver and a real socket are in the request path.
+- **`raw`** — the same aggregate without FastAPI. A control on how much of the
+  scaling limit is the framework, not a suggestion to stop using one.
+
+Two dials decide the answer, and are the first thing to reach for:
+`--lines N` lengthens the aggregate, `--cpu N` burns `pg_tax.py`'s CPU kernel in
+the handler. See [How much speedup should you expect?](#how-much-speedup-should-you-expect-it-depends-entirely-on-the-handler).
 
 Result (median of 5 runs of 20,000 requests over 16 keep-alive connections;
 tonio 0.8.3 + tonio-monkey 0.4.0 from PyPI vs this tree, release build; fastapi
@@ -346,6 +352,11 @@ efficiency cores). **req/s, higher is better:**
 mt_asyncio goes 14,306 → 35,992 req/s from one worker to four — **2.5×** — and
 ends up 1.51× stdlib on the same app with the same handler. Nothing in the
 application was written for it.
+
+**But 1.51× is the floor of this benchmark, not its result** — see the next
+section before quoting it. The default handler is deliberately tiny, and a
+request that spends most of its time in fixed per-request cost has little for a
+second core to do.
 
 **The per-request floor is the price.** At one worker mt_asyncio serves 0.60× as
 many requests as stdlib on `compute` and 0.48× on `ping`, so it spends the first
@@ -376,6 +387,81 @@ composes with `compat.install()` rather than replacing it.
 throughput from 4t to 8t on `compute` (mt 35,992 → 31,261; tonio 42,214 →
 37,531). There are 6 performance cores, the client wants some of them, and the
 efficiency cores are slower — this is the machine, not the runtimes.
+
+### How much speedup should you expect? It depends entirely on the handler
+
+The table above answers "what if my handler does almost nothing?", and 1.5× is
+the honest answer to that question. It is not the answer to "what does this
+runtime do for a service that computes something", which is the question worth
+asking. `--cpu N` burns N iterations of `pg_tax.py`'s kernel in the handler and
+moves the parallel fraction directly (`--lines N` does the same, more gently, by
+lengthening the aggregate).
+
+Same app, same server, same client; 32 connections, median of 3, **req/s**:
+
+| `--cpu` | arm | 1t | 2t | 4t | 8t | 12t | best vs stdlib |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | `stdlib` | 23,303 | · | · | · | · | 1.00× |
+| | `mt` | 14,389 | 23,053 | **30,456** | 29,784 | 24,833 | 1.31× |
+| | `tonio` | 25,776 | 32,603 | **41,020** | 33,243 | 26,020 | 1.76× |
+| 5,000 | `stdlib` | 7,988 | · | · | · | · | 1.00× |
+| | `mt` | 6,677 | 11,743 | 20,310 | **22,542** | 22,415 | 2.82× |
+| | `tonio` | 8,076 | 13,360 | 22,407 | **24,872** | 24,394 | 3.11× |
+| 20,000 | `stdlib` | 2,590 | · | · | · | · | 1.00× |
+| | `mt` | 2,404 | 4,683 | 8,812 | 11,192 | **12,376** | 4.78× |
+| | `tonio` | 2,571 | 5,047 | 8,950 | 11,892 | **13,523** | 5.22× |
+| 50,000 | `stdlib` | 1,030 | · | · | · | · | 1.00× |
+| | `mt` | 1,038 | 2,066 | 3,851 | 5,344 | **6,538** | **6.35×** |
+| | `tonio` | 1,080 | 2,120 | 3,835 | 5,283 | **5,993** | 5.82× |
+
+**1.31× → 6.35×, and the mechanism is visible in the 1t column.** mt_asyncio's
+one-worker throughput goes from 0.62× stdlib at `--cpu 0` to 0.84×, 0.93× and
+finally 1.01× — its fixed per-request overhead is constant, so the more the
+handler does, the less that overhead is worth. At `--cpu 0` the first two
+workers are spent buying it back and only the third and fourth are profit; by
+`--cpu 50000` there is nothing to buy back and all twelve are profit, for 6.3×
+self-scaling (1,038 → 6,538). That is the same order as `asyncio_bench.py`'s
+7.34× on CPU-between-awaits, which is the ceiling this converges on once HTTP
+stops dominating.
+
+**More thread is not always more.** At `--cpu 0` both parallel arms peak at 4
+workers and lose ground by 12; at `--cpu 50000` both are still climbing at 12.
+The knee moves right as the handler gets heavier, because coordination is a fixed
+cost per request and there is more work to hide it behind.
+
+**`--cpu 50000` is also where mt_asyncio finally passes TonIO** (6,538 vs 5,993).
+TonIO leads everywhere the per-operation cost dominates — that is the asyncio
+layer, priced in `tonio_regression.py` — and the lead disappears once the
+handler, which both runtimes step identically, is the bulk of the request.
+
+### It is not the framework
+
+The obvious suspicion about a 1.5× is that FastAPI is the bottleneck — all that
+shared routing and validation state, refcounted across cores. The `raw` workload
+is the control: identical `summarise` over identical rows, identical JSON out,
+reached by a dict lookup instead of starlette routing and pydantic validation.
+
+At `--lines 2048` it scales 8,089 → 18,394 req/s from 1 to 4 workers (2.27×)
+against FastAPI's 6,637 → 15,793 (2.38×). **The same curve.** FastAPI costs
+throughput per request; it does not cost scaling. Whatever caps the speedup is
+underneath both.
+
+Sampling the server process during a run says what that is — the cores are
+there, but each one delivers less (`mt`, `compute`, `--lines 2048`, 15s runs):
+
+| workers | server CPU | req/s | req/s per core | efficiency |
+| --- | --- | --- | --- | --- |
+| 1 | 96% | 6,237 | 6,488 | 100% |
+| 2 | 188% | 8,939 | 4,752 | 73% |
+| 4 | 369% | 14,874 | 4,033 | 62% |
+| 8 | 555% | 17,383 | 3,130 | 48% |
+
+The client is not competing for them — `oha` sampled at 34% of one core against
+the server's 513%. The efficiency loss starts at 2 workers, on a machine with 6
+performance cores, so it is not core starvation either. It is the per-request
+coordination that a socket read, a reactor wakeup and a cross-thread task step
+cost, and `--cpu` works precisely because it gives that coordination more work to
+amortise against.
 
 ### The server is not a strawman
 
