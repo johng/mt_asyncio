@@ -42,18 +42,38 @@ def test_sleep():
 
 
 def test_gather_ordered_and_concurrent():
+    """`gather` returns in argument order and runs its children concurrently.
+
+    Concurrency is checked by overlap, not by the clock. The old assertion was
+    `elapsed < 0.2` against sleeps summing to exactly 0.2 -- it demanded the run
+    beat a perfectly serial one with zero overhead, and on a loaded macOS runner
+    it measured 0.36, slower than serial from scheduling stalls alone.
+
+    What actually separates concurrent from serial is that every child is in
+    flight at the same moment: the last one starts before the first one
+    finishes. Serial execution cannot do that however fast the machine is, and
+    concurrent execution does it however slow the machine is. The only thing
+    that can still break it is a spawn skew wider than the shortest sleep, so
+    the sleeps are sized to leave 100ms of room for that.
+    """
+    spans = {}
+
     async def item(v, d):
+        spans[v] = [time.monotonic(), None]
         await aio.sleep(d)
+        spans[v][1] = time.monotonic()
         return v
 
     async def main():
-        start = time.monotonic()
-        out = await aio.gather(item(1, 0.05), item(2, 0.1), item(3, 0.05))
-        return out, time.monotonic() - start
+        return await aio.gather(item(1, 0.1), item(2, 0.2), item(3, 0.1))
 
-    out, elapsed = aio.run(main())
-    assert out == [1, 2, 3]
-    assert elapsed < 0.2  # concurrent, not summed
+    assert aio.run(main()) == [1, 2, 3]
+
+    last_start = max(start for start, _ in spans.values())
+    first_finish = min(finish for _, finish in spans.values())
+    assert last_start < first_finish, (
+        f'children ran one after another: last started {last_start - first_finish:.3f}s after the first finished'
+    )
 
 
 def test_gather_return_exceptions():
