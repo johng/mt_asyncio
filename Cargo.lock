@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "mt_asyncio"
-version = "0.2.0-alpha.1"
+version = "0.3.0-alpha.1"
 dependencies = [
  "anyhow",
  "arc-swap",

@@ -37,6 +37,7 @@ per completion.
 from __future__ import annotations
 
 import threading
+import traceback
 
 
 __all__ = ['defer_wakes', 'pending_wakes']
@@ -86,8 +87,6 @@ class _DeferWakes:
             try:
                 wake()
             except BaseException:  # reported, never swallowed silently
-                import traceback
-
                 traceback.print_exc()
         return False
 

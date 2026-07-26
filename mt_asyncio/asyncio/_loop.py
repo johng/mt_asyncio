@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio as _aio
 import concurrent.futures as _cf
+import contextvars
 import errno
 import functools
 import select
@@ -26,13 +27,15 @@ import threading
 import time as _time
 import traceback
 import weakref
+from asyncio.selector_events import BaseSelectorEventLoop as _Sel
+from selectors import _fileobj_to_fd
 
 from .. import io as _tio
 from .._mt_asyncio import CancelledError as _MtAsyncioCancelled, Event as _Event, get_runtime
 from . import _net
 from ._futures import Future
 from ._reactor import reactor as _reactor
-from ._tasks import Task, _park, _running_loop
+from ._tasks import Task, _running_loop, ensure_future
 from ._wakes import pending_wakes
 
 
@@ -85,18 +88,9 @@ _POLL_IN = select.POLLIN | select.POLLPRI
 _POLL_OUT = select.POLLOUT
 
 
-def _fileno(fileobj):
-    """Coerce a file object or raw fd to an int, as ``selectors`` does."""
-    if isinstance(fileobj, int):
-        fd = fileobj
-    else:
-        try:
-            fd = int(fileobj.fileno())
-        except (AttributeError, TypeError, ValueError):
-            raise ValueError(f'Invalid file object: {fileobj!r}') from None
-    if fd < 0:
-        raise ValueError(f'Invalid file descriptor: {fd}')
-    return fd
+#: file object or raw fd -> int. Borrowed: it is what ``selectors`` does to
+#  everything, and so what the ``_Sel`` methods below assume has happened.
+_fileno = _fileobj_to_fd
 
 
 def _fd_ready(fd, mask):
@@ -284,7 +278,7 @@ class _FdHandle(Handle):
 class _MtAsyncioExecutor(_cf.Executor):
     """concurrent.futures.Executor backed by mt_asyncio's blocking thread-pool."""
 
-    __slots__ = []
+    __slots__ = ()
 
     def submit(self, fn, /, *args, **kwargs):
         cfut: _cf.Future = _cf.Future()
@@ -483,8 +477,6 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
     def run_until_complete(self, coro):
         self._check_closed()
         self._ensure_reactor()
-        from ._tasks import ensure_future
-
         fut = ensure_future(coro, loop=self)
         done = threading.Event()
         fut.add_done_callback(lambda _f: done.set())
@@ -523,16 +515,8 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
             self._reactor_acquired = False
             _reactor.release()
         with self._sios_lock:
-            regs = list(self._sios.values())
-            self._sios.clear()
-        for reg in regs:
-            for handle in (reg.reader, reg.writer):
-                if handle is not None:
-                    handle.cancel()
-            try:
-                reg.sio.close()
-            except Exception:  # best-effort cleanup
-                pass
+            for fd in list(self._sios):
+                self._drop_registration(fd)
 
     async def shutdown_asyncgens(self):
         return None
@@ -589,30 +573,13 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
 
     # -- add_reader/add_writer ----------------------------------------------
 
-    def _ensure_fd_no_transport(self, fd):
-        try:
-            transport = self._transports[_fileno(fd)]
-        except KeyError:
-            pass
-        else:
-            if not transport.is_closing():
-                raise RuntimeError(f'File descriptor {fd!r} is used by transport {transport!r}')
-
-    def add_reader(self, fd, callback, *args):
-        self._ensure_fd_no_transport(fd)
-        self._add_reader(fd, callback, *args)
-
-    def add_writer(self, fd, callback, *args):
-        self._ensure_fd_no_transport(fd)
-        self._add_writer(fd, callback, *args)
-
-    def remove_reader(self, fd):
-        self._ensure_fd_no_transport(fd)
-        return self._remove_reader(fd)
-
-    def remove_writer(self, fd):
-        self._ensure_fd_no_transport(fd)
-        return self._remove_writer(fd)
+    # borrowed from CPython, unmodified: all four are "reject an fd a transport
+    # owns, then delegate", and what they delegate to is ours
+    _ensure_fd_no_transport = _Sel._ensure_fd_no_transport
+    add_reader = _Sel.add_reader
+    add_writer = _Sel.add_writer
+    remove_reader = _Sel.remove_reader
+    remove_writer = _Sel.remove_writer
 
     # `context` is keyword-only and 3.15-only at the call sites that pass it
     # (a transport forwards the context its connection was opened in), but
@@ -684,14 +651,14 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
         fut = self.create_future()
         if sio.arm_r_cb(functools.partial(_set_result_unless_done, fut)):
             return True
-        await _park(fut)
+        await fut
         return False
 
     async def _wait_writable(self, sio):
         fut = self.create_future()
         if sio.arm_w_cb(functools.partial(_set_result_unless_done, fut)):
             return True
-        await _park(fut)
+        await fut
         return False
 
     async def sock_recv(self, sock, n):
@@ -778,12 +745,6 @@ class EventLoop(_net.NetworkMixin, _aio.AbstractEventLoop):
         return await self.run_in_executor(None, socket.getnameinfo, sockaddr, flags)
 
 
-def _copy_context():
-    import contextvars
-
-    return contextvars.copy_context()
-
-
 def _handle_context(context):
     """The context a single scheduled callback will run in.
 
@@ -801,7 +762,7 @@ def _handle_context(context):
     caller set; writes made inside one callback do not leak into the next, which
     under parallel dispatch is the only well-defined answer available.
     """
-    return context.copy() if context is not None else _copy_context()
+    return context.copy() if context is not None else contextvars.copy_context()
 
 
 def _set_result_unless_done(fut, *args):

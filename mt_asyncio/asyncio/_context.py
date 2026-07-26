@@ -25,7 +25,3 @@ def get_running_loop():
     if loop is None:
         raise RuntimeError('no running event loop')
     return loop
-
-
-def _get_running_loop():
-    return _running_loop.get()

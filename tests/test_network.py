@@ -14,6 +14,7 @@ import asyncio
 import socket
 import ssl
 import threading
+import time
 
 import pytest
 
@@ -587,11 +588,17 @@ def test_reader_does_not_run_between_a_write_and_the_next_suspension(aio):
     compiled out of release builds, calls into ``None`` as though it were a
     ``PreparedStatementState``.
     """
-    conns, rounds = 6, 30
+    conns, rounds = 6, 8
     msg = b'ping'
-    # long enough that the loopback reply lands inside the window, short enough
-    # to stay well under the reader's deferral backstop
-    settle = 40000
+    # A duration, deliberately, not an iteration count. The window has two
+    # bounds: it must outlast a loopback round trip (or the race is not run at
+    # all) and stay well inside the reader's 50ms deferral backstop (or the
+    # backstop fires and the read is delivered legitimately). An iteration count
+    # cannot honour both -- it is ~1ms on a fast machine and well past 50ms on a
+    # loaded 3-core CI runner with every connection spinning at once, which is
+    # exactly how this test first failed. 10ms holds the margin on any machine,
+    # and errs towards not catching the bug rather than towards a red build.
+    settle = 0.010
 
     class WriteThenFinish(asyncio.Protocol):
         def __init__(self, loop):
@@ -610,7 +617,8 @@ def test_reader_does_not_run_between_a_write_and_the_next_suspension(aio):
             waiter = self.waiter = self.loop.create_future()
             self.request_ready = None
             self.transport.write(msg)  # network op
-            for _ in range(settle):
+            deadline = time.monotonic() + settle
+            while time.monotonic() < deadline:
                 if self.seen_early:
                     break
             self.request_ready = 'ready'

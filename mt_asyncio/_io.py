@@ -6,7 +6,7 @@ from ._mt_asyncio import ScheduledIO as _ScheduledIO, Waiter
 
 
 class ScheduledIO(_ScheduledIO):
-    __slots__ = []
+    __slots__ = ()
 
     def arm_r(self, timeout: int | float | None = None) -> Waiter | None:
         timeout = round(max(0, timeout * 1_000_000)) if timeout is not None else timeout

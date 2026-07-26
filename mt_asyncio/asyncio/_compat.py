@@ -38,10 +38,12 @@ problem. The only construct that would slip through is a hand-rolled
 ``_asyncio_future_blocking`` awaitable, which appears nowhere in the stdlib
 outside ``asyncio`` itself.
 
-What this does *not* supply is transports: ``create_connection``,
-``create_server`` and ``add_reader``/``add_writer`` are still missing, so
-libraries that open their own sockets (asyncpg, psycopg's async API, aiohttp)
-remain out of reach. See ``COMPATIBILITY.md``.
+Transports are supplied -- ``create_connection``/``create_server``/``start_tls``,
+``add_reader``/``add_writer`` and the streams layer -- so libraries that open their
+own sockets (aiohttp, websockets, psycopg, asyncpg) run on it; ``tests/test_netlibs.py``
+drives each under both backends and compares. What shadowing cannot fix is state a
+library shares *across* tasks: a lock held during a protocol callback is held by
+neither party to a race between two tasks. See ``COMPATIBILITY.md``.
 """
 
 from __future__ import annotations
@@ -49,6 +51,11 @@ from __future__ import annotations
 import sys
 import threading
 from typing import Any
+
+# the package we shadow the stdlib *with*. It imports us on its last line, so it
+# is part-built here -- fine, because nothing reads an attribute off it until
+# `install()` runs.
+import mt_asyncio.asyncio as _mt
 
 
 # Names shadowed in the stdlib asyncio namespace. Every one of these exists in
@@ -135,15 +142,13 @@ def install() -> None:
         if _installed is not None:
             return
 
-        import mt_asyncio.asyncio as mt
-
         saved: list[tuple[Any, str, Any]] = []
         for mod_name in _TARGET_MODULES:
             mod = sys.modules.get(mod_name)
             if mod is None:
                 continue
             for name in _SHADOWED:
-                replacement = getattr(mt, name, None)
+                replacement = getattr(_mt, name, None)
                 if replacement is None or not hasattr(mod, name):
                     continue
                 saved.append((mod, name, getattr(mod, name)))

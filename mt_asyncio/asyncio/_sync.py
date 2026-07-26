@@ -10,11 +10,12 @@ our Future tracks cancellation so ``release`` simply skips a cancelled waiter.
 from __future__ import annotations
 
 import collections
+import heapq
 import threading
 from asyncio import CancelledError
 from types import GenericAlias
 
-from ._tasks import _park, get_running_loop
+from ._context import get_running_loop
 
 
 __all__ = [
@@ -63,7 +64,7 @@ class Event:
             fut = get_running_loop().create_future()
             self._waiters.append(fut)
         try:
-            await _park(fut)
+            await fut
         except CancelledError:
             with self._mu:
                 if fut in self._waiters:
@@ -90,7 +91,7 @@ class Lock:
             fut = get_running_loop().create_future()
             self._waiters.append(fut)
         try:
-            await _park(fut)
+            await fut
         except CancelledError:
             granted = False
             with self._mu:
@@ -141,7 +142,7 @@ class Semaphore:
             fut = get_running_loop().create_future()
             self._waiters.append(fut)
         try:
-            await _park(fut)
+            await fut
         except CancelledError:
             granted = False
             with self._mu:
@@ -208,7 +209,7 @@ class Condition:
             self._waiters.append(fut)
         self._lock.release()
         try:
-            await _park(fut)
+            await fut
         except CancelledError:
             with self._mu:
                 if fut in self._waiters:
@@ -310,7 +311,7 @@ class Queue:
                 fut = get_running_loop().create_future()
                 self._putters.append(fut)
             try:
-                await _park(fut)
+                await fut
             except CancelledError:
                 with self._mu:
                     if fut in self._putters:
@@ -340,7 +341,7 @@ class Queue:
                 fut = get_running_loop().create_future()
                 self._getters.append(fut)
             try:
-                await _park(fut)
+                await fut
             except CancelledError:
                 with self._mu:
                     if fut in self._getters:
@@ -371,12 +372,6 @@ class LifoQueue(Queue):
     def _init(self, maxsize):
         self._queue: list = []
 
-    def _qlen(self):
-        return len(self._queue)
-
-    def _put(self, item):
-        self._queue.append(item)
-
     def _get(self):
         return self._queue.pop()
 
@@ -385,15 +380,8 @@ class PriorityQueue(Queue):
     def _init(self, maxsize):
         self._queue: list = []
 
-    def _qlen(self):
-        return len(self._queue)
-
     def _put(self, item):
-        import heapq
-
         heapq.heappush(self._queue, item)
 
     def _get(self):
-        import heapq
-
         return heapq.heappop(self._queue)

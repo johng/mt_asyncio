@@ -15,7 +15,9 @@ runtime to be created with ``context=True``.
 
 from __future__ import annotations
 
+import inspect
 import itertools
+import traceback
 from asyncio import CancelledError
 
 from .._mt_asyncio import get_runtime
@@ -36,12 +38,6 @@ __all__ = [
 ]
 
 _task_name_counter = itertools.count(1).__next__
-
-
-async def _park(fut):
-    """Await ``fut``; arming for cancellation now happens in ``Future.__await__``,
-    so this is a thin passthrough kept for call-site readability."""
-    return await fut
 
 
 class Task(Future):
@@ -98,8 +94,6 @@ class Task(Future):
         return frames
 
     def print_stack(self, *, limit=None, file=None):
-        import traceback
-
         for frame in self.get_stack(limit=limit):
             traceback.print_stack(frame, limit=1, file=file)
 
@@ -196,14 +190,8 @@ class Task(Future):
 def ensure_future(coro_or_future, *, loop=None):
     if isfuture(coro_or_future):
         return coro_or_future
-    if _iscoroutine(coro_or_future):
+    if inspect.iscoroutine(coro_or_future):
         if loop is None:
             loop = get_running_loop()
         return loop.create_task(coro_or_future)
     raise TypeError(f'An asyncio.Future, a coroutine or an awaitable is required, got {coro_or_future!r}')
-
-
-def _iscoroutine(obj):
-    import inspect
-
-    return inspect.iscoroutine(obj)

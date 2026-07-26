@@ -11,6 +11,7 @@ from asyncio import TimeoutError as _TimeoutError
 
 from ._context import get_running_loop
 from ._futures import isfuture
+from ._loop import _wrap_concurrent_future
 from ._sync import Queue
 from ._tasks import ensure_future
 
@@ -101,6 +102,4 @@ def wrap_future(future, *, loop=None):
         raise TypeError(f'A concurrent.futures.Future is required, got {future!r}')
     if loop is None:
         loop = get_running_loop()
-    from ._loop import _wrap_concurrent_future
-
     return _wrap_concurrent_future(future, loop)

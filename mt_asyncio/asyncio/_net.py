@@ -38,6 +38,10 @@ import threading
 from asyncio.base_events import BaseEventLoop as _Base, Server as _Server, _set_reuseport
 from asyncio.selector_events import BaseSelectorEventLoop as _Sel
 
+from ._context import get_running_loop
+from ._sleep import sleep
+from ._streams import StreamReader, StreamReaderProtocol, StreamWriter
+from ._tls import make_ssl_transport, start_tls as _start_tls
 from ._transports import SocketTransport
 
 
@@ -61,8 +65,6 @@ class Server(_Server):
         self._mt_lock = threading.RLock()
 
     async def start_serving(self):
-        from ._ctl import sleep
-
         self._start_serving()
         await sleep(0)
 
@@ -129,8 +131,6 @@ class NetworkMixin:
         ssl_shutdown_timeout=None,
         context=None,
     ):
-        from ._tls import make_ssl_transport
-
         return make_ssl_transport(
             self,
             rawsock,
@@ -173,8 +173,6 @@ class NetworkMixin:
         ssl_shutdown_timeout=None,
         start_serving=True,
     ):
-        from ._ctl import sleep
-
         if isinstance(ssl, bool):
             raise TypeError('ssl argument must be an SSLContext or None')
         if ssl_handshake_timeout is not None and ssl is None:
@@ -260,9 +258,7 @@ class NetworkMixin:
         ssl_handshake_timeout=None,
         ssl_shutdown_timeout=None,
     ):
-        from ._tls import start_tls
-
-        return await start_tls(
+        return await _start_tls(
             self,
             transport,
             protocol,
@@ -275,9 +271,6 @@ class NetworkMixin:
 
 
 async def open_connection(host=None, port=None, *, limit=2**16, **kwds):
-    from ._streams import StreamReader, StreamReaderProtocol, StreamWriter
-    from ._tasks import get_running_loop
-
     loop = get_running_loop()
     reader = StreamReader(limit=limit, loop=loop)
     protocol = StreamReaderProtocol(reader, loop=loop)
@@ -287,9 +280,6 @@ async def open_connection(host=None, port=None, *, limit=2**16, **kwds):
 
 
 async def start_server(client_connected_cb, host=None, port=None, *, limit=2**16, **kwds):
-    from ._streams import StreamReader, StreamReaderProtocol
-    from ._tasks import get_running_loop
-
     loop = get_running_loop()
 
     def factory():
