@@ -11,9 +11,10 @@ import mt_asyncio.asyncio as asyncio
 is a drop-in for code written against `asyncio`. This document records exactly
 what is supported, what behaves differently, and what is not implemented.
 
-Coverage of the public `asyncio` namespace: **43 / 119 names**. The bulk of what
-is missing is one coherent subsystem (streams/transports/subprocess) plus
-introspection and loop-policy plumbing — see [Not implemented](#not-implemented).
+Coverage of the public `asyncio` namespace: **49 / 119 names**. TCP and TLS
+transports, streams and servers are covered; what is missing is Unix-domain
+sockets, datagrams and pipes, subprocesses, and introspection and loop-policy
+plumbing — see [Not implemented](#not-implemented).
 
 ---
 
@@ -113,6 +114,20 @@ the multi-threaded Future.
 (cancellable, on mt_asyncio's edge-triggered reactor), exception handler hooks,
 `shutdown_asyncgens`, `shutdown_default_executor`, `set_debug`/`get_debug`.
 
+### Networking (TCP and TLS)
+`open_connection`, `start_server`, `StreamReader`, `StreamWriter`,
+`StreamReaderProtocol`, `Server`, `loop.create_connection`, `loop.create_server`,
+`loop.start_tls`, and `loop.add_reader`/`add_writer`/`remove_reader`/`remove_writer`
+(level-triggered and persistent, as asyncio's contract requires — see `_loop.py`).
+`happy_eyeballs_delay` is accepted and ignored, so connection attempts are made
+sequentially; that is a latency difference, not a behavioural one.
+
+Transport and protocol *base classes* are not re-exported and do not need to be:
+our transports subclass `asyncio.Transport`, our `Server` subclasses
+`asyncio.AbstractServer` and our `StreamReader` subclasses `asyncio.StreamReader`,
+so `asyncio.Protocol` subclasses and `isinstance` checks against the stdlib ABCs
+work unchanged.
+
 Cancellation is delivered cooperatively at every `await` (bugfixed: bare
 `await future` is cancellable, not only helper-wrapped awaits), and cleanup that
 itself `await`s works — unlike the runtime's native `abort()`, which poisons cleanup.
@@ -142,18 +157,19 @@ divergence that is not listed here is a bug.
 
 Categorized, with rationale and the practical workaround.
 
-### High-level networking (streams / transports / protocols)
-Missing: `open_connection`, `open_unix_connection`, `start_server`,
-`start_unix_server`, `StreamReader`, `StreamWriter`, `StreamReaderProtocol`,
-`Transport`/`ReadTransport`/`WriteTransport`/`BaseTransport`,
-`Protocol`/`BaseProtocol`/`BufferedProtocol`, `DatagramProtocol`/`DatagramTransport`,
-`Server`, `AbstractServer`, `loop.create_connection`, `loop.create_server`,
-`loop.add_reader`/`add_writer`.
+### Unix-domain sockets, datagrams and pipes
+Missing: `open_unix_connection`, `start_unix_server`,
+`loop.create_unix_connection`/`create_unix_server`,
+`loop.create_datagram_endpoint`, `DatagramProtocol`/`DatagramTransport`,
+`loop.connect_read_pipe`/`connect_write_pipe`, `loop.sendfile`,
+`SendfileNotAvailableError`. Each raises `NotImplementedError` from
+`AbstractEventLoop`, which is the failure we want.
 
-- **Why:** the entire transport/protocol stack sits on `add_reader`/`add_writer`,
-  which are not implemented. This is the largest single gap.
-- **Workaround:** use the low-level `sock_*` methods (fully supported and
-  cancellable) for socket I/O.
+- **Why:** TCP is what the transport layer was built and measured against; each
+  of these is a separate registration path over the same reactor, not yet ported.
+  This is the largest remaining gap.
+- **Workaround:** the low-level `sock_*` methods are fully supported and
+  cancellable, and work on any socket — including `AF_UNIX` and datagram sockets.
 
 ### Subprocesses
 Missing: `create_subprocess_exec`, `create_subprocess_shell`,
@@ -171,7 +187,9 @@ Missing: `AbstractEventLoop`, `BaseEventLoop`, `SelectorEventLoop`, `Runner`,
 `get_event_loop_policy`, `set_event_loop_policy`, `set_event_loop`, `Handle`,
 `TimerHandle` (the last two exist internally in `_loop.py`, just not exported).
 - **Why:** the mt loop is its own `EventLoop`, not a `BaseEventLoop` subclass;
-  policies are deprecated in 3.14. `run()` covers `Runner`'s role.
+  policies are deprecated in 3.14. `run()` covers `Runner`'s role. `EventLoop`
+  *does* subclass `asyncio.AbstractEventLoop`, so third-party `isinstance` checks
+  pass — only the name is not re-exported.
 - **Workaround:** use `mt_asyncio.asyncio.run` / `new_event_loop` directly.
 
 ### Introspection / debugging
@@ -184,9 +202,15 @@ Missing: `capture_call_graph`, `format_call_graph`, `print_call_graph`,
 Missing: `create_eager_task_factory`, `eager_task_factory`.
 - **Why:** they close over the C `Task`; our tasks always start on the runtime.
 
-### Stream/misc exceptions
-Missing: `IncompleteReadError`, `LimitOverrunError`, `SendfileNotAvailableError`,
-`QueueShutDown` (+ `Queue.shutdown()`).
+### Queue shutdown
+Missing: `QueueShutDown` and `Queue.shutdown()`.
+
+### Stream exceptions: raised, not re-exported
+`IncompleteReadError` and `LimitOverrunError` are **not** in this namespace, but
+they are what our streams raise — the `StreamReader` parsing layer is CPython's,
+reused untouched. Catch them as `asyncio.IncompleteReadError` /
+`asyncio.LimitOverrunError`; `mt_asyncio.asyncio.IncompleteReadError` is an
+`AttributeError`.
 
 ---
 
@@ -260,9 +284,9 @@ install before importing anything that should see it.
 
 ### What compat does not fix: shared state across tasks
 
-Transports *are* implemented — `add_reader`/`add_writer`, `create_connection`,
+Transports are implemented — `add_reader`/`add_writer`, `create_connection`,
 `create_server`, `start_tls` and the streams layer all work, and
-`tests/test_network.py` runs 48 scenarios against both backends. What compat
+`tests/test_network.py` runs 29 scenarios against both backends. What compat
 cannot fix is one layer up.
 
 The locking in `_transports.py`, `_tls.py` and `_streams.py` makes a *connection*
@@ -289,7 +313,7 @@ inside an un-awaited `close_task`, so `closed_waiter` is never resolved and
 library code running in a task. A lock held during protocol callbacks is held by
 neither participant, and serialising tasks would mean giving up the parallelism
 this project exists for. Libraries that share mutable state between tasks need
-their own locks — the same conclusion as §6, applied one level up.
+their own locks — the same conclusion as §1, applied one level up.
 
 Requests themselves are reliable: aiohttp served every request correctly in all
 12 runs, over both HTTP and HTTPS, and only its *shutdown* races.
@@ -308,7 +332,7 @@ asyncio** (single-core by design) against **`mt_asyncio.asyncio`** running the
 byte-for-byte same coroutines. Each configuration runs in a fresh process;
 figures are the median of 3 measured runs after a warmup.
 
-Environment: free-threaded CPython 3.14.4, mt_asyncio 0.8.3 (**release** build), Apple
+Environment: free-threaded CPython 3.14.4, mt_asyncio **release** build, Apple
 M5 Max — 18 CPUs, but only **6 of them are performance cores** (12 are efficiency
 cores). Past 8 threads the runtime is scheduling onto efficiency cores, which is
 why several workloads flatten between 8 and 16 threads rather than continuing to
@@ -316,33 +340,43 @@ climb. Absolute numbers are machine-specific; re-run before quoting. Run against
 a release build — a debug build is several times slower, and the bench scripts
 refuse to run on one.
 
-Full speedup matrix vs stdlib asyncio:
+Full speedup matrix vs stdlib asyncio, all 20 workloads:
 
 | workload | 1t | 2t | 4t | 8t | 16t | verdict |
 |---|---|---|---|---|---|---|
-| `mixed` (CPU between awaits) | 1.21× | 2.34× | 3.43× | 6.42× | **7.34×** | scales — the headline case |
-| `wait_for_overhead` (each unit under `wait_for`) | 0.97× | 1.86× | 3.42× | 3.52× | **6.59×** | scales — the `wait_for` scaffolding is not the bottleneck |
-| `taskgroup_fanout` (fan-out via `TaskGroup`) | 1.08× | 1.85× | 3.60× | 4.22× | **5.72×** | scales |
-| `semaphore_bounded` (bounded concurrency + CPU) | 0.97× | 2.11× | 3.84× | **5.52×** | 4.75× | scales |
-| `gather_fanout` (fan-out + CPU) | 1.00× | 1.74× | 2.27× | 3.38× | **5.32×** | scales |
-| `sock_work` (I/O + per-request CPU — real server handler) | 1.00× | 1.79× | 3.30× | 4.44× | **5.28×** | scales |
-| `queue_pipeline` (producer→`Queue`→consumers) | 1.02× | 1.84× | 2.88× | **3.88×** | 3.14× | scales to 8, then the queue handoff dominates |
-| `lock_contention` (one shared `Lock`) | 0.95× | 1.78× | **3.01×** | 2.48× | 2.82× | partial — the critical section serializes by construction; only work outside the lock parallelizes |
-| `churn` (bare awaits, no work) | 1.41× | 1.23× | 1.29× | 1.42× | **1.60×** | faster than stdlib even with nothing to parallelize |
-| `executor_offload` (`to_thread`) | 0.98× | 1.24× | 1.21× | **1.24×** | 1.17× | ~parity — both pools are genuinely parallel on a free-threaded build, so this is pure dispatch cost |
-| `sock_echo` (socketpair ping-pong, no work) | 0.72× | 0.83× | **1.16×** | 0.99× | 1.15× | latency-bound; each `recv` pays a cross-thread reactor hop, so it only reaches parity |
-| `timer_sleep` (many real `sleep`s) | 0.51× | 0.47× | **0.55×** | 0.43× | 0.38× | **loses** — see below |
-| `cancel_heavy` (create+cancel+unwind) | **0.62×** | 0.41× | 0.38× | 0.27× | 0.20× | **loses**, and degrades with threads — cancellation is all coordination |
+| `block_inline` (blocking call made in the coroutine) | 1.01× | 2.00× | 3.91× | 7.44× | **14.31×** | scales hardest — stdlib stalls its one loop thread for the whole call, we stall one worker of many |
+| `gather_fanout` (fan-out + CPU) | 0.98× | 1.76× | 3.44× | 4.79× | **7.08×** | scales |
+| `taskgroup_fanout` (fan-out via `TaskGroup`) | 0.99× | 1.86× | 3.07× | 3.41× | **6.67×** | scales |
+| `mixed` (CPU between awaits) | 1.04× | 2.09× | 3.89× | 5.50× | **6.37×** | scales — the headline case |
+| `wait_for_overhead` (each unit under `wait_for`) | 1.00× | 1.93× | 3.12× | 4.37× | **5.86×** | scales — the `wait_for` scaffolding is not the bottleneck |
+| `sock_work` (I/O + per-request CPU — real server handler) | 0.99× | 1.80× | 3.26× | 3.70× | **5.47×** | scales |
+| `stream_work` (transport + streams + per-request CPU) | 0.88× | 1.69× | 3.02× | 3.94× | **5.27×** | scales — the per-connection lock is not the ceiling |
+| `tls_work` (same over TLS) | 0.91× | 1.74× | 3.19× | 4.15× | **5.27×** | scales — `sslproto` under the connection lock costs ~nothing extra |
+| `semaphore_bounded` (bounded concurrency + CPU) | 1.01× | 1.85× | 2.92× | **4.96×** | 4.89× | scales |
+| `db_query` (sync driver via `to_thread`) | 0.99× | 1.75× | 2.73× | 3.52× | **4.91×** | scales — one OS thread per in-flight query |
+| `queue_pipeline` (producer→`Queue`→consumers) | 1.03× | 1.71× | 3.08× | **3.22×** | 2.56× | scales to 8, then the queue handoff dominates |
+| `lock_contention` (one shared `Lock`) | 0.98× | 1.76× | **2.97×** | 2.19× | 2.35× | partial — the critical section serializes by construction; only work outside the lock parallelizes |
+| `block_offload` (same blocking call via `to_thread`) | 2.54× | 2.59× | **2.61×** | 2.60× | 2.51× | flat and ahead — both pools are real threads; the win is dispatch, not width |
+| `db_query_async` (psycopg async API on our reactor) | 0.93× | 1.46× | 2.02× | **2.12×** | 2.09× | partial — a reactor hop per round trip caps it below `db_query` |
+| `churn` (bare awaits, no work) | 1.65× | 1.21× | **1.71×** | 1.43× | 1.60× | faster than stdlib even with nothing to parallelize |
+| `executor_offload` (`to_thread`) | 0.77× | 0.99× | **1.02×** | 1.00× | 1.01× | ~parity — pure dispatch cost |
+| `sock_echo` (socketpair ping-pong, no work) | 0.67× | 0.80× | **0.95×** | 0.67× | 0.57× | latency-bound; each `recv` pays a cross-thread reactor hop, so it only reaches parity |
+| `timer_sleep` (many real `sleep`s) | 0.54× | 0.51× | **0.63×** | 0.55× | 0.53× | **loses** — see below |
+| `cancel_heavy` (create+cancel+unwind) | **0.57×** | 0.38× | 0.33× | 0.25× | 0.20× | **loses**, and degrades with threads — cancellation is all coordination |
+| `stream_echo` (transport + streams ping-pong, no work) | 0.17× | 0.29× | 0.47× | 0.46× | **0.55×** | **loses worst** — see below |
 
 The I/O pair is the headline for servers: a handler doing per-request work
-(`sock_work`) reaches 5.3× — one loop, many connections, request processing
+(`sock_work`) reaches 5.5× — one loop, many connections, request processing
 across cores, which a single stdlib loop cannot do at all. The same code path
 with *no* per-request work (`sock_echo`) only reaches parity, because there is
 nothing to parallelize and every round-trip crosses the reactor.
 
+`db_query_async` needs `MT_ASYNCIO_BENCH_DSN`; without it that row is skipped and
+the rest of the suite still runs.
+
 **Read this honestly.** mt_asyncio is at rough parity with stdlib per thread and wins
 by parallelizing, so the more real work a task does between awaits, the better it
-does. Two areas genuinely lose:
+does. Three areas genuinely lose:
 
 - **Timers.** `sleep()` builds a `Future`, a `TimerHandle`, a contextvars copy
   and a *helper coroutine* that awaits a native waiter, then hops through a
@@ -352,10 +386,24 @@ does. Two areas genuinely lose:
   inherent cost, and is the clearest optimization target in the layer.
 - **Cancellation.** `cancel_heavy` is pure coordination with no work to spread,
   so more threads make it *worse*.
+- **Idle streams.** `stream_echo` is the worst cell in the suite: 55 µs per
+  round-trip against stdlib's 10 µs. It is *not* the per-connection locking —
+  disabling the connection claims and `defer_wakes` together recovers only ~3%
+  (352 ms → 342 ms), and per-round-trip call counts are exactly 2.00 of each of
+  `_arm`/`_dispatch`/`_read_ready`/`feed_data`/`write`, one per side, with no
+  re-arm spinning. It is scheduling hops. `sock_echo` costs 17 µs on the same
+  runtime because `sock_recv` parks the task *directly* on fd readiness — one
+  hop. The transport path takes two: reactor → worker runs `_read_ready` →
+  `data_received` → `feed_data` completes the reader's waiter → a second handle →
+  a worker steps the reading task. With `cpu=0` there is nothing to weigh against
+  those hops, which is exactly why `stream_work` (same path, real handler work)
+  reaches 5.3×.
 
-Caveat on reading the table: the worst run-to-run spread was ~22%
-(`cancel_heavy`, `gather_fanout@4t`, `sock_work@4t`), so single cells within
-~20% of each other are not distinguishable.
+Caveat on reading the table: the median run-to-run spread was 3.5% across all 120
+cells, but the worst reached ~29% (`executor_offload@16t`, `queue_pipeline@16t`,
+`timer_sleep`'s stdlib baseline, `taskgroup_fanout@8t`). Single cells within ~25%
+of each other are not distinguishable; re-run with `--repeat 9` before believing
+any one of them.
 
 ### Versus upstream TonIO
 
@@ -366,12 +414,20 @@ through their raw primitives with byte-for-byte identical Python
 
 | core workload | 1t | 4t | 8t |
 |---|---|---|---|
-| `yield_churn` (one coroutine, N suspensions) | **1.37×** | **1.68×** | **1.48×** |
-| `spawn_join` (spawn N, join all) | **1.42×** | **1.54×** | **1.56×** |
-| `offload` (blocking-pool dispatch) | **1.13×** | **1.12×** | **1.10×** |
-| `sleep_timers` (real timers) | 1.00× | 1.09× | 0.88× |
-| `cpu_scale` (CPU between suspensions) | 0.99× | 0.94× | 1.00× |
+| `spawn_join` (spawn N, join all) | **1.28×** | **1.54×** | **1.65×** |
+| `yield_churn` (one coroutine, N suspensions) | **1.22×** | **1.33×** | **1.45×** |
+| `offload` (blocking-pool dispatch) | **1.11×** | **1.07×** | **1.19×** |
+| `sleep_timers` (real timers) | 1.00× | 1.15× | 1.07× |
+| `cpu_scale` (CPU between suspensions) | 0.96× | 0.98× | 0.97× |
 
-(> 1.00× means mt_asyncio is faster.) No regression: the suspend/resume and spawn
-paths got faster, and workloads bounded by something other than the core sit at
-parity. The lone sub-1.0 cell had 63% spread and is noise.
+(> 1.00× means mt_asyncio is faster.) No regression in the scheduler: the
+suspend/resume and spawn paths got faster — and by more at higher thread counts,
+which is where a core change would show — and the timer and blocking-pool paths
+sit at or above parity.
+
+The exception is `cpu_scale`, consistently 0.96–0.98× at every thread count with
+run-to-run spreads of only 1–4%, so it is a real few-percent deficit rather than
+noise. It is also the one workload here that is CPU-bound rather than
+core-bound — 256 tasks burning 100k units between four suspensions each — so what
+it prices is mostly the interpreter doing arithmetic, not the runtime scheduling
+it. Worth re-checking if it ever grows.

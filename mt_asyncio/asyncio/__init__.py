@@ -38,7 +38,6 @@ from ._ctl import (
     gather as gather,
     run as run,
     shield as shield,
-    sleep as sleep,
     wait as wait,
     wait_for as wait_for,
 )
@@ -49,6 +48,7 @@ from ._net import (
     open_connection as open_connection,
     start_server as start_server,
 )
+from ._sleep import sleep as sleep
 from ._streams import (
     StreamReader as StreamReader,
     StreamReaderProtocol as StreamReaderProtocol,
@@ -157,10 +157,10 @@ __all__ = [
     'new_event_loop',
     'open_connection',
     'run',
-    'start_server',
     'run_coroutine_threadsafe',
     'shield',
     'sleep',
+    'start_server',
     'timeout',
     'timeout_at',
     'to_thread',

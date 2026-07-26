@@ -236,6 +236,16 @@ def wl_executor_offload(aio, *, calls, cpu):
     return main, calls
 
 
+class Skipped(Exception):
+    """A workload that cannot run here -- no DSN, no driver installed, etc.
+
+    Raised from the *builder*, which the parent calls before measuring anything,
+    so an unrunnable workload costs one exception and the rest of the suite still
+    runs. A bare `raise` would take the whole run down with it and silently drop
+    every workload after this one.
+    """
+
+
 class _SleepDriver:
     """Stand-in for a sync DB driver: one blocking call, latency-dominated."""
 
@@ -336,12 +346,15 @@ def wl_db_query_async(aio, *, queries, pool_size, latency, cpu):
     """
     dsn = os.environ.get('MT_ASYNCIO_BENCH_DSN')
     if not dsn:
-        raise RuntimeError('the db_query_async workload needs MT_ASYNCIO_BENCH_DSN set')
+        raise Skipped('needs MT_ASYNCIO_BENCH_DSN set (the db_query sleep stand-in would measure nothing here)')
 
     # compat must be installed before psycopg binds `from asyncio import ...`
     if getattr(aio, 'compat', None) is not None:
         aio.compat.install()
-    import psycopg
+    try:
+        import psycopg
+    except ImportError:
+        raise Skipped('needs psycopg installed') from None
 
     async def main():
         sem = aio.Semaphore(pool_size)
@@ -835,11 +848,16 @@ def main():
 
     import asyncio as _stdlib
 
-    results = {}
+    results, skipped = {}, {}
     for name in args.workload:
         builder, base_params, unit, blurb = WORKLOADS[name]
         params = _scaled(base_params, args.scale)
-        _, ops = builder(_stdlib, **params)
+        try:
+            _, ops = builder(_stdlib, **params)
+        except Skipped as exc:
+            skipped[name] = str(exc)
+            _emit(['', f'## {name} — {blurb}', '', f'**skipped** — {exc}', ''], report)
+            continue
 
         _emit(['', f'## {name} — {blurb}', '', f'{ops:,} {unit}; params={params}', ''], report)
 
@@ -866,7 +884,7 @@ def main():
                 report,
             )
 
-    if len(args.workload) > 1:
+    if len(results) > 1:
         _emit(['', '## summary — speedup vs stdlib asyncio', ''], report)
         _emit(
             [
@@ -875,7 +893,7 @@ def main():
             ],
             report,
         )
-        for name in args.workload:
+        for name in results:
             entry = results[name]
             base = entry['stdlib']['median']
             speeds = {t: base / entry['mt_asyncio'][t]['median'] for t in args.threads}
@@ -883,9 +901,17 @@ def main():
             cells = ' | '.join(f'{speeds[t]:.2f}x' for t in args.threads)
             _emit([f'| `{name}` | {cells} | **{speeds[best_t]:.2f}x** @{best_t} |'], report)
 
+    # loud enough to notice, so a partial run is never mistaken for a full one
+    if skipped:
+        _emit(['', '## skipped', ''] + [f'- `{n}` — {why}' for n, why in skipped.items()], report)
+
     if args.json:
         with open(args.json, 'w') as f:
-            json.dump({'env': env, 'repeat': args.repeat, 'scale': args.scale, 'results': results}, f, indent=2)
+            json.dump(
+                {'env': env, 'repeat': args.repeat, 'scale': args.scale, 'results': results, 'skipped': skipped},
+                f,
+                indent=2,
+            )
         print(f'\nwrote {args.json}')
     if args.markdown:
         with open(args.markdown, 'w') as f:

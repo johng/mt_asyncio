@@ -1,6 +1,6 @@
 """Process-wide lifecycle for the shared mt_asyncio runtime behind asyncio loops.
 
-Multiple :class:`MtAsyncioEventLoop` instances (e.g. one per OS thread in a
+Multiple :class:`~._loop.EventLoop` instances (e.g. one per OS thread in a
 worker-per-thread server) share a single mt_asyncio runtime and its reactor. The
 runtime must therefore be started once and stopped only when the *last* loop is
 done with it -- a per-loop start/stop races ("self-socket already setup") and a

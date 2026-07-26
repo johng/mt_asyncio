@@ -53,6 +53,8 @@ from asyncio.streams import (
     StreamWriter as _StreamWriter,
 )
 
+from ._sleep import sleep
+
 
 class StreamReader(_StreamReader):
     """``asyncio.StreamReader`` with a race-free feed/wait handoff."""
@@ -187,8 +189,6 @@ class StreamWriter(_StreamWriter):
     """``asyncio.StreamWriter`` whose ``drain`` does not await stdlib's sleep."""
 
     async def drain(self):
-        from ._ctl import sleep
-
         if self._reader is not None:
             exc = self._reader.exception()
             if exc is not None:

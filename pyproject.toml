@@ -22,7 +22,7 @@ classifiers = [
 # that PR publishes. Declared here rather than left dynamic so there is one
 # obvious place to change and one for CI to read (Cargo.toml keeps its own
 # version for the Rust crate, which is not published anywhere).
-version = '0.2.0-alpha.1'
+version = '0.3.0-alpha.1'
 
 dynamic = [
     'description',

@@ -10,20 +10,20 @@ because callbacks run on worker threads, possibly concurrently.
 from __future__ import annotations
 
 import functools
+import inspect
 import threading
 from asyncio import CancelledError, TimeoutError as _TimeoutError
 
-from .._mt_asyncio import Event as _Event
 from ._loop import EventLoop
-from ._tasks import _park, _running_loop, current_task, ensure_future, get_running_loop
+from ._tasks import _running_loop, current_task, ensure_future, get_running_loop
 from ._timeouts import timeout as _timeout_ctx
 
 
 __all__ = [
+    'current_task',
     'gather',
     'run',
     'shield',
-    'sleep',
     'wait',
     'wait_for',
 ]
@@ -32,8 +32,6 @@ __all__ = [
 def run(main, *, debug=None, threads=None):
     if _running_loop.get() is not None:
         raise RuntimeError('mt_asyncio.asyncio.run() cannot be called from a running event loop')
-    import inspect
-
     if not inspect.iscoroutine(main):
         # mirrors asyncio.Runner.run: awaitables are wrapped, anything else is a TypeError
         if inspect.isawaitable(main):
@@ -65,35 +63,6 @@ def _cancel_all_tasks(loop):
     for task in to_cancel:
         task.cancel()
     loop.run_until_complete(gather(*to_cancel, return_exceptions=True))
-
-
-async def _yield_now():
-    # the one suspension point that does not go through `Future.__await__`, so
-    # it has to hand back connection claims itself (see `_transports`)
-    task = current_task()
-    if task is not None and task._mt_claims is not None:
-        task._mt_release_claims()
-    ev = _Event()
-    ev.set()
-    await ev.waiter(None)
-
-
-async def sleep(delay, result=None):
-    loop = get_running_loop()
-    if delay <= 0:
-        await _yield_now()
-        return result
-    fut = loop.create_future()
-    handle = loop.call_later(delay, _set_result_unless_done, fut, result)
-    try:
-        return await _park(fut)
-    finally:
-        handle.cancel()
-
-
-def _set_result_unless_done(fut, value):
-    if not fut.done():
-        fut.set_result(value)
 
 
 def _release_waiter(waiter, *_args):
@@ -176,45 +145,33 @@ def shield(aw):
 async def gather(*coros_or_futures, return_exceptions=False):
     loop = get_running_loop()
     if not coros_or_futures:
-        empty = loop.create_future()
-        empty.set_result([])
-        return await _park(empty)
+        return []
 
     children = [ensure_future(c, loop=loop) for c in coros_or_futures]
-    n = len(children)
-    results = [None] * n
+    results = [None] * len(children)
     outer = loop.create_future()
     lock = threading.Lock()
-    state = {'remaining': n, 'settled': False}
+    remaining = len(children)
+    settled = False
 
     def _child_done(index, child):
+        nonlocal remaining, settled
         with lock:
-            if state['settled']:
+            if settled:
                 return
             if child.cancelled():
                 exc = CancelledError()
-                if return_exceptions:
-                    results[index] = exc
-                else:
-                    state['settled'] = True
-                    if not outer.done():
-                        outer.set_exception(exc)
-                    return
             else:
                 exc = child.exception()
-                if exc is not None:
-                    if return_exceptions:
-                        results[index] = exc
-                    else:
-                        state['settled'] = True
-                        if not outer.done():
-                            outer.set_exception(exc)
-                        return
-                else:
-                    results[index] = child.result()
-            state['remaining'] -= 1
-            if state['remaining'] == 0:
-                state['settled'] = True
+            if exc is not None and not return_exceptions:
+                settled = True
+                if not outer.done():
+                    outer.set_exception(exc)
+                return
+            results[index] = exc if exc is not None else child.result()
+            remaining -= 1
+            if remaining == 0:
+                settled = True
                 if not outer.done():
                     outer.set_result(results)
 
@@ -222,7 +179,7 @@ async def gather(*coros_or_futures, return_exceptions=False):
         child.add_done_callback(functools.partial(_child_done, i))
 
     try:
-        return await _park(outer)
+        return await outer
     except CancelledError:
         for child in children:
             child.cancel()
@@ -241,33 +198,41 @@ async def wait(aws, *, timeout=None, return_when=_ALL_COMPLETED):
         raise ValueError('Set of Tasks/Futures is empty.')
     waiter = loop.create_future()
     lock = threading.Lock()
-    counter = {'done': 0, 'settled': False}
+    ndone = 0
+    settled = False
     n = len(tasks)
 
     def _release():
-        if not counter['settled']:
-            counter['settled'] = True
+        """Wake the caller. Call with `lock` held."""
+        nonlocal settled
+        if not settled:
+            settled = True
             if not waiter.done():
                 waiter.set_result(None)
 
     def _on_done(t):
+        nonlocal ndone
         with lock:
-            counter['done'] += 1
+            ndone += 1
             if return_when == _FIRST_COMPLETED:
                 _release()
             elif return_when == _FIRST_EXCEPTION and (t.cancelled() or t.exception() is not None):
                 _release()
-            elif counter['done'] == n:
+            elif ndone == n:
                 _release()
+
+    def _on_timeout():
+        with lock:
+            _release()
 
     for t in tasks:
         t.add_done_callback(_on_done)
 
     handle = None
     if timeout is not None:
-        handle = loop.call_later(timeout, lambda: (_with_lock(lock, _release)))
+        handle = loop.call_later(timeout, _on_timeout)
     try:
-        await _park(waiter)
+        await waiter
     finally:
         if handle is not None:
             handle.cancel()
@@ -278,12 +243,3 @@ async def wait(aws, *, timeout=None, return_when=_ALL_COMPLETED):
     for t in tasks:
         (done if t.done() else pending).add(t)
     return done, pending
-
-
-def _with_lock(lock, fn):
-    with lock:
-        fn()
-
-
-# re-export helpers used elsewhere
-__all__ += ['current_task']

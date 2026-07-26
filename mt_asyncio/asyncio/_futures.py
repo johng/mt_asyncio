@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import contextvars
 import threading
-from asyncio import CancelledError, InvalidStateError
+from asyncio import CancelledError, InvalidStateError, isfuture as isfuture
 from types import GenericAlias
 
 from .._mt_asyncio import Event as _Event
@@ -223,5 +223,6 @@ class Future:
         return CancelledError(self._cancel_message)
 
 
-def isfuture(obj):
-    return getattr(obj, '_asyncio_future_blocking', None) is not None
+# `isfuture` is CPython's, re-exported: a duck-type predicate on
+# `_asyncio_future_blocking` with no loop dependency, which `Future` declares as a
+# class attribute (see above) precisely so it answers True.
